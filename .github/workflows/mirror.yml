@@ -83,7 +83,7 @@ jobs:
           print("Cancellation was requested before runner start." if cancelled else "Run registration completed.")
           PY
 
-      - name: Install MEGAcmd and Python packages
+      - name: Install only the dependencies required for this run
         id: setup_deps
         if: steps.register.outputs.cancelled != 'true'
         timeout-minutes: 15
@@ -97,8 +97,8 @@ jobs:
               "file_name": os.environ.get("POST_TITLE", ""), "run_id": os.environ.get("RUN_ID", ""),
               "run_number": os.environ.get("RUN_NUMBER", ""), "run_url": os.environ.get("RUN_URL", ""),
               "need_pd": os.environ.get("NEED_PD", "yes"), "need_mega": os.environ.get("NEED_MEGA", "yes"),
-              "platform": "GitHub runner", "stage": "Installing dependencies",
-              "message": "Installing MEGAcmd and Python download packages.",
+              "platform": "GitHub runner", "stage": "Installing conditional dependencies",
+              "message": ("Installing MEGAcmd and Python download packages." if os.environ.get("NEED_MEGA", "no") == "yes" else "Installing Python download packages only; MEGAcmd is skipped for this run."),
               "webhook_secret": os.environ.get("WEBHOOK_SECRET", "")
           }
           try:
@@ -107,21 +107,28 @@ jobs:
           except Exception as exc:
               print("WordPress progress callback warning:", exc)
           PY
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg
-
-          # Official MEGA APT repository for Ubuntu 24.04.
-          curl -fsSL --retry 3 --retry-all-errors --retry-delay 3 https://mega.nz/linux/repo/xUbuntu_24.04/Release.key \
-            | sudo gpg --dearmor --yes -o /usr/share/keyrings/megacmd-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/megacmd-archive-keyring.gpg] https://mega.nz/linux/repo/xUbuntu_24.04/ ./" \
-            | sudo tee /etc/apt/sources.list.d/megacmd.list >/dev/null
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends megacmd
-
+          # Download tooling is always required. MEGAcmd is deliberately conditional:
+          # Pixeldrain-only repairs must not waste time installing or starting MEGA.
           python -m pip install --disable-pip-version-check --no-input --upgrade gdown requests
-          command -v mega-login
-          command -v mega-put
-          command -v mega-export
+
+          if [[ "${NEED_MEGA:-no}" == "yes" ]]; then
+            echo "This run requires MEGA. Installing MEGAcmd..."
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg
+
+            # Official MEGA APT repository for Ubuntu 24.04.
+            curl -fsSL --retry 3 --retry-all-errors --retry-delay 3 https://mega.nz/linux/repo/xUbuntu_24.04/Release.key \
+              | sudo gpg --dearmor --yes -o /usr/share/keyrings/megacmd-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/megacmd-archive-keyring.gpg] https://mega.nz/linux/repo/xUbuntu_24.04/ ./" \
+              | sudo tee /etc/apt/sources.list.d/megacmd.list >/dev/null
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends megacmd
+            command -v mega-login
+            command -v mega-put
+            command -v mega-export
+          else
+            echo "NEED_MEGA=no: skipping MEGAcmd installation. This is a Pixeldrain-only (or non-MEGA) run."
+          fi
           python - <<'PY'
           import json, os, urllib.request
           payload = {
@@ -130,8 +137,8 @@ jobs:
               "file_name": os.environ.get("POST_TITLE", ""), "run_id": os.environ.get("RUN_ID", ""),
               "run_number": os.environ.get("RUN_NUMBER", ""), "run_url": os.environ.get("RUN_URL", ""),
               "need_pd": os.environ.get("NEED_PD", "yes"), "need_mega": os.environ.get("NEED_MEGA", "yes"),
-              "platform": "GitHub runner", "stage": "Dependencies ready",
-              "message": "MEGAcmd, gdown and requests are installed. Starting Google Drive metadata lookup.",
+              "platform": ("MEGA + GitHub runner" if os.environ.get("NEED_MEGA", "no") == "yes" else "Pixeldrain + GitHub runner"), "stage": "Dependencies ready",
+              "message": ("MEGAcmd, gdown and requests are ready. Starting Google Drive metadata lookup." if os.environ.get("NEED_MEGA", "no") == "yes" else "gdown and requests are ready; MEGAcmd installation was skipped. Starting Google Drive metadata lookup."),
               "webhook_secret": os.environ.get("WEBHOOK_SECRET", "")
           }
           try:
@@ -522,7 +529,10 @@ jobs:
 
           final_error = os.environ.get("FINAL_ERROR", "")
           if action == "failed" and not final_error and os.environ.get("DEPENDENCIES_OUTCOME") == "failure":
-              final_error = "MEGAcmd/Python dependency installation failed. Open the GitHub run and inspect the Install MEGAcmd and Python packages step."
+              if os.environ.get("NEED_MEGA", "no") == "yes":
+                  final_error = "Runner dependency setup failed (Python packages or MEGAcmd). Open the GitHub run and inspect the conditional dependency-install step."
+              else:
+                  final_error = "Python download-package setup failed. MEGAcmd was intentionally skipped for this Pixeldrain-only run. Inspect the dependency-install step in GitHub Actions."
           payload = {
               "action": action,
               "request_id": os.environ.get("REQUEST_ID", ""),
