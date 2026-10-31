@@ -1,563 +1,430 @@
-name: Auto Mirror Google Drive to Cloud
+name: Auto Mirror Google Drive to CLOBD Backups
 
 run-name: >-
-  Mirror ${{ github.event.client_payload.file_name || 'Google Drive file' }}
-  — Post #${{ github.event.client_payload.post_id }}
+  CLOBD Queue ${{ github.event.client_payload.queue_id || 'legacy' }} - Post #${{ github.event.client_payload.post_id || 'unknown' }}
 
 on:
   repository_dispatch:
     types: [mirror_gdrive_file]
 
+# WordPress dispatches only one queue item at a time. This is a second safety
+# layer so two accidental/manual GitHub dispatches cannot upload concurrently.
+concurrency:
+  group: clobd-cloud-mirror-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
 permissions:
   contents: read
 
-concurrency:
-  # Every WordPress dispatch has its own request_id. Do not cancel unrelated files.
-  group: clobd-mirror-${{ github.event.client_payload.request_id || github.run_id }}
-  cancel-in-progress: false
-
 jobs:
   mirror_file:
-    name: Run Auto Upload Script
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
-    env:
-      PYTHONUNBUFFERED: "1"
-      REQUEST_ID: ${{ github.event.client_payload.request_id }}
-      POST_ID: ${{ github.event.client_payload.post_id }}
-      POST_TITLE: ${{ github.event.client_payload.file_name }}
-      GDRIVE_ID: ${{ github.event.client_payload.gdrive_id }}
-      NEED_PD: ${{ github.event.client_payload.need_pd }}
-      NEED_MEGA: ${{ github.event.client_payload.need_mega }}
-      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
-      WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
-      PIXELDRAIN_API_KEY: ${{ github.event.client_payload.pixeldrain_api }}
-      MEGA_ACCOUNTS: ${{ github.event.client_payload.mega_accounts }}
-      RUN_ID: ${{ github.run_id }}
-      RUN_NUMBER: ${{ github.run_number }}
-      RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
     steps:
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v7
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          check-latest: false
+          python-version: '3.11'
 
-      - name: Register run in WordPress
-        id: register
-        continue-on-error: true
-        timeout-minutes: 2
+      - name: Register GitHub Run ID in WordPress Queue
+        id: report_queue
+        env:
+          QUEUE_ID: ${{ github.event.client_payload.queue_id }}
+          RUN_ID: ${{ github.run_id }}
+          STATUS_URL: ${{ github.event.client_payload.status_url }}
+          WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
         run: |
           python - <<'PY'
-          import json, os, urllib.request, urllib.error
-
-          url = os.environ.get("CALLBACK_URL", "").strip()
-          payload = {
-              "action": "started",
-              "request_id": os.environ.get("REQUEST_ID", ""),
-              "post_id": os.environ.get("POST_ID", ""),
-              "gdrive_id": os.environ.get("GDRIVE_ID", ""),
-              "file_name": os.environ.get("POST_TITLE", ""),
-              "run_id": os.environ.get("RUN_ID", ""),
-              "run_number": os.environ.get("RUN_NUMBER", ""),
-              "run_url": os.environ.get("RUN_URL", ""),
-              "need_pd": os.environ.get("NEED_PD", "yes"),
-              "need_mega": os.environ.get("NEED_MEGA", "yes"),
-              "platform": "Starting",
-              "stage": "GitHub runner started",
-              "message": "Workflow started and registered.",
-              "webhook_secret": os.environ.get("WEBHOOK_SECRET", ""),
-          }
-          cancelled = False
-          try:
-              request = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
-              with urllib.request.urlopen(request, timeout=20) as response:
-                  data = json.loads(response.read().decode() or "{}")
-                  cancelled = bool(data.get("cancel_requested"))
-          except Exception as exc:
-              print(f"WordPress registration warning: {exc}")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"cancelled={'true' if cancelled else 'false'}\n")
-          print("Cancellation was requested before runner start." if cancelled else "Run registration completed.")
-          PY
-
-      - name: Install only the dependencies required for this run
-        id: setup_deps
-        if: steps.register.outputs.cancelled != 'true'
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json, os, urllib.request
-          payload = {
-              "action": "progress", "request_id": os.environ.get("REQUEST_ID", ""),
-              "post_id": os.environ.get("POST_ID", ""), "gdrive_id": os.environ.get("GDRIVE_ID", ""),
-              "file_name": os.environ.get("POST_TITLE", ""), "run_id": os.environ.get("RUN_ID", ""),
-              "run_number": os.environ.get("RUN_NUMBER", ""), "run_url": os.environ.get("RUN_URL", ""),
-              "need_pd": os.environ.get("NEED_PD", "yes"), "need_mega": os.environ.get("NEED_MEGA", "yes"),
-              "platform": "GitHub runner", "stage": "Installing conditional dependencies",
-              "message": ("Installing MEGAcmd and Python download packages." if os.environ.get("NEED_MEGA", "no") == "yes" else "Installing Python download packages only; MEGAcmd is skipped for this run."),
-              "webhook_secret": os.environ.get("WEBHOOK_SECRET", "")
-          }
-          try:
-              req = urllib.request.Request(os.environ.get("CALLBACK_URL", ""), data=json.dumps(payload).encode(), headers={"Content-Type":"application/json"}, method="POST")
-              urllib.request.urlopen(req, timeout=20).read()
-          except Exception as exc:
-              print("WordPress progress callback warning:", exc)
-          PY
-          # Download tooling is always required. MEGAcmd is deliberately conditional:
-          # Pixeldrain-only repairs must not waste time installing or starting MEGA.
-          python -m pip install --disable-pip-version-check --no-input --upgrade gdown requests
-
-          if [[ "${NEED_MEGA:-no}" == "yes" ]]; then
-            echo "This run requires MEGA. Installing MEGAcmd..."
-            sudo apt-get update -y
-            sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg
-
-            # Official MEGA APT repository for Ubuntu 24.04.
-            curl -fsSL --retry 3 --retry-all-errors --retry-delay 3 https://mega.nz/linux/repo/xUbuntu_24.04/Release.key \
-              | sudo gpg --dearmor --yes -o /usr/share/keyrings/megacmd-archive-keyring.gpg
-            echo "deb [signed-by=/usr/share/keyrings/megacmd-archive-keyring.gpg] https://mega.nz/linux/repo/xUbuntu_24.04/ ./" \
-              | sudo tee /etc/apt/sources.list.d/megacmd.list >/dev/null
-            sudo apt-get update -y
-            sudo apt-get install -y --no-install-recommends megacmd
-            command -v mega-login
-            command -v mega-put
-            command -v mega-export
-          else
-            echo "NEED_MEGA=no: skipping MEGAcmd installation. This is a Pixeldrain-only (or non-MEGA) run."
-          fi
-          python - <<'PY'
-          import json, os, urllib.request
-          payload = {
-              "action": "progress", "request_id": os.environ.get("REQUEST_ID", ""),
-              "post_id": os.environ.get("POST_ID", ""), "gdrive_id": os.environ.get("GDRIVE_ID", ""),
-              "file_name": os.environ.get("POST_TITLE", ""), "run_id": os.environ.get("RUN_ID", ""),
-              "run_number": os.environ.get("RUN_NUMBER", ""), "run_url": os.environ.get("RUN_URL", ""),
-              "need_pd": os.environ.get("NEED_PD", "yes"), "need_mega": os.environ.get("NEED_MEGA", "yes"),
-              "platform": ("MEGA + GitHub runner" if os.environ.get("NEED_MEGA", "no") == "yes" else "Pixeldrain + GitHub runner"), "stage": "Dependencies ready",
-              "message": ("MEGAcmd, gdown and requests are ready. Starting Google Drive metadata lookup." if os.environ.get("NEED_MEGA", "no") == "yes" else "gdown and requests are ready; MEGAcmd installation was skipped. Starting Google Drive metadata lookup."),
-              "webhook_secret": os.environ.get("WEBHOOK_SECRET", "")
-          }
-          try:
-              req = urllib.request.Request(os.environ.get("CALLBACK_URL", ""), data=json.dumps(payload).encode(), headers={"Content-Type":"application/json"}, method="POST")
-              urllib.request.urlopen(req, timeout=20).read()
-          except Exception as exc:
-              print("WordPress progress callback warning:", exc)
-          PY
-
-      - name: Run Auto Upload Script
-        id: mirror
-        if: steps.register.outputs.cancelled != 'true'
-        timeout-minutes: 105
-        run: |
-          python - <<'PY'
-          import os
-          import sys
-          import re
           import json
-          import time
-          import math
-          import queue
-          import shutil
-          import threading
-          import subprocess
-          from pathlib import Path
-          from urllib.parse import quote
-          import requests
+          import os
+          import urllib.error
+          import urllib.request
 
-          CALLBACK_URL = os.environ.get("CALLBACK_URL", "").strip()
-          WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-          REQUEST_ID = os.environ.get("REQUEST_ID", "")
-          POST_ID = os.environ.get("POST_ID", "")
-          POST_TITLE = os.environ.get("POST_TITLE", "")
-          GDRIVE_ID = os.environ.get("GDRIVE_ID", "").strip()
-          NEED_PD = os.environ.get("NEED_PD", "yes").lower() == "yes"
-          NEED_MEGA = os.environ.get("NEED_MEGA", "yes").lower() == "yes"
-          PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "").strip()
-          MEGA_ACCOUNTS = os.environ.get("MEGA_ACCOUNTS", "")
-          RUN_ID = os.environ.get("RUN_ID", "")
-          RUN_NUMBER = os.environ.get("RUN_NUMBER", "")
-          RUN_URL = os.environ.get("RUN_URL", "")
-
-          WORK_DIR = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"clobd-mirror-{REQUEST_ID or RUN_ID}"
-          WORK_DIR.mkdir(parents=True, exist_ok=True)
-          PIXELDRAIN_URL = ""
-          MEGA_URL = ""
-          MEGA_ACCOUNT_USED = ""
-          FILE_NAME = POST_TITLE or f"Google-Drive-{GDRIVE_ID}"
-          ERROR_MESSAGE = ""
-          CURRENT_PLATFORM = "Preparing"
-          CURRENT_STAGE = "Initialising upload"
-
-          def write_output(key, value):
-              value = str(value or "").replace("\r", " ").replace("\n", " ")
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-                  output.write(f"{key}={value}\n")
-
-          def report(action="progress", platform=None, stage=None, message="", extra=None):
-              if not CALLBACK_URL or not WEBHOOK_SECRET:
-                  return {}
+          status_url = os.environ.get("STATUS_URL", "").strip()
+          queue_id = os.environ.get("QUEUE_ID", "").strip()
+          if status_url and queue_id:
               payload = {
-                  "action": action,
-                  "request_id": REQUEST_ID,
-                  "post_id": POST_ID,
-                  "gdrive_id": GDRIVE_ID,
-                  "file_name": FILE_NAME,
-                  "run_id": RUN_ID,
-                  "run_number": RUN_NUMBER,
-                  "run_url": RUN_URL,
-                  "need_pd": "yes" if NEED_PD else "no",
-                  "need_mega": "yes" if NEED_MEGA else "no",
-                  "platform": platform or CURRENT_PLATFORM,
-                  "stage": stage or CURRENT_STAGE,
-                  "message": message,
-                  "pixeldrain_url": PIXELDRAIN_URL,
-                  "mega_url": MEGA_URL,
-                  "mega_account": MEGA_ACCOUNT_USED,
-                  "webhook_secret": WEBHOOK_SECRET,
+                  "webhook_secret": os.environ.get("WEBHOOK_SECRET", ""),
+                  "queue_id": queue_id,
+                  "run_id": os.environ.get("RUN_ID", ""),
+                  "stage": "GitHub Actions runner started",
+                  "platform": "Preparing",
+                  "message": "GitHub Run ID registered. Preparing dependencies."
               }
-              if extra:
-                  payload.update(extra)
-              for attempt in range(3):
-                  try:
-                      response = requests.post(CALLBACK_URL, json=payload, timeout=20)
-                      response.raise_for_status()
-                      try:
-                          return response.json()
-                      except Exception:
-                          return {}
-                  except Exception as exc:
-                      print(f"WordPress status callback attempt {attempt + 1}/3 failed: {exc}")
-                      if attempt < 2:
-                          time.sleep(3 * (attempt + 1))
-              return {}
-
-          def run_live(command, platform, stage, timeout_seconds, allow_failure=False, extra_env=None):
-              global CURRENT_PLATFORM, CURRENT_STAGE
-              CURRENT_PLATFORM, CURRENT_STAGE = platform, stage
-              start_state = report("progress", platform, stage, "Started: " + stage)
-              if start_state.get("cancel_requested"):
-                  write_output("cancelled", "true")
-                  report("cancelled", platform, stage, "Upload stopped from the WordPress dashboard.")
-                  write_output("file_name", FILE_NAME)
-                  write_output("pixeldrain_url", PIXELDRAIN_URL)
-                  write_output("mega_url", MEGA_URL)
-                  write_output("mega_account", MEGA_ACCOUNT_USED)
-                  raise SystemExit(0)
-              env = os.environ.copy()
-              if extra_env:
-                  env.update(extra_env)
-              print(f"\n--- {platform}: {stage} ---")
-              process = subprocess.Popen(
-                  command,
-                  stdin=subprocess.DEVNULL,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT,
-                  text=True,
-                  bufsize=1,
-                  env=env,
+              request = urllib.request.Request(
+                  status_url,
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={"Content-Type": "application/json", "User-Agent": "CLOBD-GitHub-Actions-Mirror"},
+                  method="POST"
               )
-              lines = queue.Queue()
-              captured = []
-
-              def reader():
+              try:
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      print("WordPress queue status:", response.status, response.read().decode("utf-8", "replace"))
+              except urllib.error.HTTPError as error:
+                  body = error.read().decode("utf-8", "replace")
                   try:
-                      for line in iter(process.stdout.readline, ""):
-                          lines.put(line)
-                  finally:
-                      lines.put(None)
+                      response_data = json.loads(body)
+                  except ValueError:
+                      response_data = {}
+                  if error.code == 409 and response_data.get("cancelled"):
+                      with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                          output.write("cancelled=true\n")
+                      print("Queue item was already cancelled in WordPress; remaining steps will be skipped.")
+                  else:
+                      raise
+          PY
 
-              worker = threading.Thread(target=reader, daemon=True)
-              worker.start()
-              started = time.monotonic()
-              last_heartbeat = started
-              stream_done = False
-              while not stream_done:
-                  elapsed = time.monotonic() - started
-                  if process.poll() is None and elapsed > timeout_seconds:
-                      process.terminate()
-                      try:
-                          process.wait(timeout=15)
-                      except subprocess.TimeoutExpired:
-                          process.kill()
-                          process.wait(timeout=10)
-                      raise TimeoutError(f"{stage} exceeded its {timeout_seconds // 60}-minute time limit.")
-                  try:
-                      line = lines.get(timeout=5)
-                  except queue.Empty:
-                      line = "__NO_LINE__"
-                  if line is None:
-                      stream_done = True
-                  elif line != "__NO_LINE__":
-                      captured.append(line)
-                      print(line, end="", flush=True)
-                  if process.poll() is None and time.monotonic() - last_heartbeat >= 30:
-                      heartbeat_state = report("heartbeat", platform, stage, f"Still running ({int(elapsed // 60)} min elapsed).")
-                      last_heartbeat = time.monotonic()
-                      if heartbeat_state.get("cancel_requested"):
-                          process.terminate()
-                          try:
-                              process.wait(timeout=15)
-                          except subprocess.TimeoutExpired:
-                              process.kill()
-                              process.wait(timeout=10)
-                          write_output("cancelled", "true")
-                          write_output("file_name", FILE_NAME)
-                          write_output("pixeldrain_url", PIXELDRAIN_URL)
-                          write_output("mega_url", MEGA_URL)
-                          write_output("mega_account", MEGA_ACCOUNT_USED)
-                          report("cancelled", platform, stage, "Upload stopped from the WordPress dashboard.")
-                          raise SystemExit(0)
-              return_code = process.wait()
-              output_text = "".join(captured)
-              if "Do you accept this terms?" in output_text or "Please enter [y]es/[n]o/[a]ll/none" in output_text:
-                  raise RuntimeError("MEGA needs a one-time manual acceptance of its copyright/sharing terms for this account. The workflow will not accept legal terms automatically. Sign in to this MEGA account with MEGAcmd, accept the prompt once, then retry the upload.")
-              if return_code != 0 and not allow_failure:
-                  tail = output_text[-1500:].strip()
-                  raise RuntimeError(f"{stage} failed with exit code {return_code}. {tail}")
-              return return_code, output_text
+      - name: Install Python Dependencies and MEGAcmd
+        if: steps.report_queue.outputs.cancelled != 'true'
+        run: |
+          python3 -m pip install --upgrade pip gdown requests
+          wget -q "https://mega.nz/linux/repo/xUbuntu_24.04/amd64/megacmd-xUbuntu_24.04_amd64.deb"
+          sudo apt-get update
+          sudo apt-get install -y "./megacmd-xUbuntu_24.04_amd64.deb" || sudo apt-get install -f -y
 
-          def parse_gdown_filename(output_text):
-              data = json.loads(output_text.strip())
-              if not isinstance(data, list) or not data:
-                  raise RuntimeError("Google Drive did not return a downloadable file entry.")
-              name = str(data[0].get("path") or "").strip()
-              name = Path(name).name
-              if not name:
-                  raise RuntimeError("Could not determine the Google Drive filename.")
-              return name
+      - name: Download from Google Drive and Upload Selected Backups
+        if: steps.report_queue.outputs.cancelled != 'true'
+        shell: python
+        env:
+          QUEUE_ID: ${{ github.event.client_payload.queue_id }}
+          RUN_ID: ${{ github.run_id }}
+          POST_ID: ${{ github.event.client_payload.post_id }}
+          GDRIVE_ID: ${{ github.event.client_payload.gdrive_id }}
+          NEED_PD: ${{ github.event.client_payload.need_pd }}
+          NEED_MEGA: ${{ github.event.client_payload.need_mega }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          STATUS_URL: ${{ github.event.client_payload.status_url }}
+          WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
+          PIXELDRAIN_API: ${{ github.event.client_payload.pixeldrain_api }}
+          MEGA_ACCOUNTS: ${{ github.event.client_payload.mega_accounts }}
+        run: |
+          import os
+          import re
+          import sys
+          import subprocess
+          import urllib.parse
+          import requests
+          import gdown
 
-          def parse_storage_bytes(text, pattern):
-              match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
-              if not match:
-                  return None
-              number = float(match.group(1).replace(",", ""))
-              unit = match.group(2).lower()
-              power = {"bytes": 0, "byte": 0, "kbytes": 1, "mbytes": 2, "gbytes": 3, "tbytes": 4, "pbytes": 5}.get(unit, 0)
-              return int(number * (1024 ** power))
+          QUEUE_ID = os.environ.get("QUEUE_ID", "").strip()
+          RUN_ID = os.environ.get("RUN_ID", "").strip()
+          POST_ID = os.environ.get("POST_ID", "").strip()
+          GDRIVE_ID = os.environ.get("GDRIVE_ID", "").strip()
+          NEED_PD = os.environ.get("NEED_PD", "no").strip().lower() == "yes"
+          NEED_MEGA = os.environ.get("NEED_MEGA", "no").strip().lower() == "yes"
+          CALLBACK_URL = os.environ.get("CALLBACK_URL", "").strip()
+          STATUS_URL = os.environ.get("STATUS_URL", "").strip()
+          WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+          PIXELDRAIN_API = os.environ.get("PIXELDRAIN_API", "").strip()
+          MEGA_ACCOUNTS_RAW = os.environ.get("MEGA_ACCOUNTS", "").strip()
 
-          def mega_size(text, label):
-              return parse_storage_bytes(text, rf"{label}:\s*([0-9][0-9,.]*)\s*(Bytes|KBytes|MBytes|GBytes|TBytes|PBytes)")
+          DOWNLOAD_DIR = os.path.abspath("downloads")
+          os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-          def upload_to_mega(file_path):
-              global MEGA_URL, MEGA_ACCOUNT_USED, CURRENT_PLATFORM, CURRENT_STAGE
-              accounts = []
-              for line in MEGA_ACCOUNTS.splitlines():
-                  line = line.strip()
-                  if not line or ":" not in line:
-                      continue
-                  email, password = line.split(":", 1)
-                  email, password = email.strip(), password.strip()
-                  if email and password:
-                      accounts.append((email, password))
+          class JobCancelled(Exception):
+              pass
+
+          def send_status(stage, platform="", message=""):
+              """Send live stage/platform information to the WordPress Queue page."""
+              if not STATUS_URL or not QUEUE_ID:
+                  return
+              payload = {
+                  "webhook_secret": WEBHOOK_SECRET,
+                  "queue_id": QUEUE_ID,
+                  "run_id": RUN_ID,
+                  "stage": stage,
+                  "platform": platform,
+                  "message": message,
+              }
+              response = requests.post(STATUS_URL, json=payload, timeout=25)
+              if response.status_code == 409:
+                  raise JobCancelled("This job was cancelled from the WordPress dashboard.")
+              response.raise_for_status()
+              try:
+                  if response.json().get("cancelled"):
+                      raise JobCancelled("This job was cancelled from the WordPress dashboard.")
+              except ValueError:
+                  pass
+
+          def send_final_callback(file_name, pd_url, mega_url, mega_account,
+                                 pd_status, mega_status, message=""):
+              if not CALLBACK_URL:
+                  raise RuntimeError("WordPress callback URL is missing.")
+              payload = {
+                  "webhook_secret": WEBHOOK_SECRET,
+                  "queue_id": QUEUE_ID,
+                  "post_id": POST_ID,
+                  "file_name": file_name or "",
+                  "pixeldrain_url": pd_url or "",
+                  "mega_url": mega_url or "",
+                  "mega_account": mega_account or "",
+                  "pd_status": pd_status,
+                  "mega_status": mega_status,
+                  "message": message,
+              }
+              response = requests.post(
+                  CALLBACK_URL,
+                  json=payload,
+                  headers={"User-Agent": "CLOBD-GitHub-Actions-Mirror"},
+                  timeout=60,
+              )
+              response.raise_for_status()
+              print("WordPress callback accepted:", response.status_code)
+
+          def get_mega_used_bytes():
+              result = subprocess.run(
+                  ["mega-df"], capture_output=True, text=True, timeout=60
+              )
+              output = (result.stdout or "") + "\n" + (result.stderr or "")
+
+              # Some MEGAcmd versions report the used bytes directly.
+              match = re.search(r"USED STORAGE:\s*(\d+)", output, re.IGNORECASE)
+              if match:
+                  return int(match.group(1))
+
+              # Fallback for percentage/total output.
+              match = re.search(
+                  r"([\d.]+)%\s+of\s+([\d.]+)\s*GB", output, re.IGNORECASE
+              )
+              if match:
+                  pct = float(match.group(1))
+                  total_gb = float(match.group(2))
+                  return int((pct / 100.0) * total_gb * (1024 ** 3))
+              return None
+
+          def upload_to_pixeldrain(file_path, file_name):
+              if not PIXELDRAIN_API:
+                  raise RuntimeError("Pixeldrain API key is not configured in WordPress.")
+              encoded_name = urllib.parse.quote(file_name, safe="")
+              api_url = f"https://pixeldrain.com/api/file/{encoded_name}"
+              with open(file_path, "rb") as file_handle:
+                  response = requests.put(
+                      api_url,
+                      auth=("", PIXELDRAIN_API),
+                      data=file_handle,
+                      timeout=(30, 7200),
+                  )
+              try:
+                  data = response.json()
+              except ValueError:
+                  data = {}
+              if response.status_code not in (200, 201) or not data.get("id"):
+                  raise RuntimeError(
+                      f"Pixeldrain HTTP {response.status_code}: {response.text[:1000]}"
+                  )
+              return "https://pixeldrain.com/u/" + str(data["id"])
+
+          def upload_to_mega(file_path, file_name, file_size):
+              accounts = [
+                  line.strip()
+                  for line in MEGA_ACCOUNTS_RAW.splitlines()
+                  if ":" in line.strip()
+              ]
               if not accounts:
-                  raise RuntimeError("No valid MEGA accounts are configured. Add email:password entries in Files > Settings.")
+                  raise RuntimeError("No MEGA accounts are configured in WordPress.")
 
-              file_size = file_path.stat().st_size
-              per_account_cap = int(19.8 * (1024 ** 3))
-              failures = []
-              for index, (email, password) in enumerate(accounts, start=1):
-                  CURRENT_PLATFORM = "MEGA"
-                  CURRENT_STAGE = f"Checking MEGA account {index}/{len(accounts)}"
-                  report("progress", "MEGA", CURRENT_STAGE, f"Checking account {email}.")
+              max_limit_bytes = int(19.8 * (1024 ** 3))
+              last_error = "No MEGA account had enough storage or could upload."
+
+              for index, account in enumerate(accounts, start=1):
+                  email, password = account.split(":", 1)
+                  email = email.strip()
+                  password = password.strip()
+                  print(f"Checking MEGA account {index}/{len(accounts)}: {email}")
+                  subprocess.run(
+                      ["mega-logout"], stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL, timeout=30
+                  )
+
                   try:
-                      run_live(["mega-logout"], "MEGA", "Reset MEGA session", 60, allow_failure=True)
-                      run_live(["mega-login", email, password], "MEGA", f"Logging in to {email}", 180)
-
-                      # Clear the account rubbish bin before measuring the 19.8 GiB quota.
-                      run_live(["mega-rm", "-r", "//bin/*"], "MEGA", f"Clearing rubbish bin ({email})", 180, allow_failure=True)
-                      _, account_info = run_live(["mega-whoami", "-l"], "MEGA", f"Checking storage quota ({email})", 120)
-                      capacity = parse_storage_bytes(account_info, r"Available storage:\s*([0-9][0-9,.]*)\s*(Bytes|KBytes|MBytes|GBytes|TBytes|PBytes)")
-                      root = mega_size(account_info, r"In ROOT") or 0
-                      inbox = mega_size(account_info, r"In INBOX") or 0
-                      rubbish = mega_size(account_info, r"In RUBBISH") or 0
-                      versions = mega_size(account_info, r"Total size taken up by file versions") or 0
-                      if capacity is None:
-                          raise RuntimeError("Could not read MEGA account storage information; account skipped to avoid exceeding the quota.")
-                      used = root + inbox + rubbish + versions
-                      effective_cap = min(capacity, per_account_cap)
-                      available = effective_cap - used
-                      if available < file_size + (32 * 1024 * 1024):
-                          failures.append(f"{email}: insufficient free space under the 19.8 GiB cap.")
-                          print(f"Skipping {email}: need {file_size} bytes, available under cap {max(0, available)} bytes.")
+                      login = subprocess.run(
+                          ["mega-login", email, password],
+                          capture_output=True, text=True, timeout=90
+                      )
+                      if login.returncode != 0:
+                          last_error = f"MEGA login failed for {email}: {(login.stderr or login.stdout)[:500]}"
+                          print("::warning::", last_error)
                           continue
 
-                      CURRENT_STAGE = f"Uploading to MEGA ({email})"
-                      report("progress", "MEGA", CURRENT_STAGE, f"Uploading {FILE_NAME} to {email}.")
-                      run_live(["mega-put", str(file_path), "/"], "MEGA", CURRENT_STAGE, 2700)
+                      # Keep the existing rubbish-bin cleanup behaviour.
+                      subprocess.run(
+                          ["mega-rm", "-r", "-f", "//bin/*"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=120
+                      )
 
-                      remote_path = "/" + file_path.name
-                      _, export_output = run_live(["mega-export", "-a", remote_path], "MEGA", f"Creating share link ({email})", 180)
-                      match = re.search(r"https://mega\.nz/[^\s]+", export_output)
+                      used_bytes = get_mega_used_bytes()
+                      if used_bytes is None:
+                          last_error = f"Could not read MEGA storage for {email}; trying next account."
+                          print("::warning::", last_error)
+                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          continue
+
+                      projected_bytes = used_bytes + file_size
+                      used_gb = round(used_bytes / (1024 ** 3), 2)
+                      projected_gb = round(projected_bytes / (1024 ** 3), 2)
+                      print(
+                          f"MEGA account {email}: used {used_gb} GB, "
+                          f"projected {projected_gb} GB / 19.8 GB"
+                      )
+
+                      if projected_bytes > max_limit_bytes:
+                          last_error = f"Not enough available storage in {email}; trying next account."
+                          print("::notice::", last_error)
+                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          continue
+
+                      send_status("Uploading file to MEGA", "mega", f"Uploading to {email}")
+                      remote_path = "/" + file_name
+                      subprocess.run(
+                          ["mega-rm", "-f", remote_path],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=60
+                      )
+                      put_result = subprocess.run(
+                          ["mega-put", file_path, "/"],
+                          capture_output=True, text=True, timeout=7200
+                      )
+                      if put_result.returncode != 0:
+                          last_error = f"MEGA upload failed for {email}: {(put_result.stderr or put_result.stdout)[:700]}"
+                          print("::warning::", last_error)
+                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          continue
+
+                      export_result = subprocess.run(
+                          ["mega-export", "-a", remote_path],
+                          capture_output=True, text=True, timeout=120
+                      )
+                      if export_result.returncode != 0:
+                          last_error = f"MEGA export failed for {email}: {(export_result.stderr or export_result.stdout)[:700]}"
+                          print("::warning::", last_error)
+                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          continue
+
+                      match = re.search(r"(https://mega\.nz/\S+)", export_result.stdout or "")
                       if not match:
-                          raise RuntimeError("MEGA upload succeeded but no public share URL was returned by mega-export.")
+                          last_error = f"MEGA uploaded to {email}, but no public link was returned."
+                          print("::warning::", last_error)
+                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          continue
 
-                      MEGA_URL = match.group(0).rstrip(".,)")
-                      MEGA_ACCOUNT_USED = email
-                      write_output("mega_url", MEGA_URL)
-                      write_output("mega_account", email)
-                      report("progress", "MEGA", "Upload completed", f"MEGA upload completed using {email}.")
-                      run_live(["mega-logout"], "MEGA", "Logout", 60, allow_failure=True)
-                      return
-                  except Exception as exc:
-                      if "one-time manual acceptance" in str(exc):
-                          raise
-                      failures.append(f"{email}: {exc}")
-                      print(f"MEGA account failed; trying the next account: {email}: {exc}")
-                      run_live(["mega-logout"], "MEGA", "Logout after failed account", 60, allow_failure=True)
+                      link = match.group(1).rstrip("\r\n")
+                      subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      return link, email
+
+                  except JobCancelled:
+                      subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      raise
+                  except Exception as error:
+                      last_error = f"MEGA account {email} error: {error}"
+                      print("::warning::", last_error)
+                      subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                       continue
-              raise RuntimeError("All MEGA accounts failed or were full. " + " | ".join(failures)[-2500:])
+
+              raise RuntimeError(last_error)
+
+          pd_status = "pending" if NEED_PD else "skipped"
+          mega_status = "pending" if NEED_MEGA else "skipped"
+          pixeldrain_url = ""
+          mega_url = ""
+          used_mega_account = ""
+          file_path = ""
+          file_name = ""
+          errors = []
+          download_ok = False
 
           try:
-              if not GDRIVE_ID:
-                  raise RuntimeError("Missing Google Drive file ID in repository_dispatch payload.")
+              if not POST_ID or not GDRIVE_ID:
+                  raise RuntimeError("Post ID or Google Drive file ID is missing.")
               if not NEED_PD and not NEED_MEGA:
-                  raise RuntimeError("No upload platform was selected (need_pd=no and need_mega=no).")
+                  raise RuntimeError("No upload destination was selected for this queue job.")
 
-              # Check WordPress once more; an admin may have disabled the run while it was queued.
-              start_response = report("started", "Starting", "Preparing file", "Runner is preparing the requested file.")
-              if start_response.get("cancel_requested"):
-                  report("cancelled", "Workflow", "Cancelled before download", "Stop was requested from the WordPress dashboard before processing began.")
-                  write_output("cancelled", "true")
-                  sys.exit(0)
+              send_status("GitHub runner started", "Preparing", "Runner is starting the file job.")
+              send_status("Downloading source from Google Drive", "Google Drive", "Downloading the source file.")
 
-              CURRENT_PLATFORM, CURRENT_STAGE = "Google Drive", "Resolving file name"
-              _, metadata = run_live([sys.executable, "-m", "gdown", GDRIVE_ID, "--json", "--quiet"], "Google Drive", "Resolving file name", 180)
-              FILE_NAME = parse_gdown_filename(metadata)
-              safe_name = re.sub(r"[\x00-\x1f]", "_", FILE_NAME).strip().strip(".") or f"gdrive_{GDRIVE_ID}"
-              file_path = WORK_DIR / safe_name
-              write_output("file_name", FILE_NAME)
-              report("progress", "Google Drive", "Downloading file", f"Downloading {FILE_NAME} from Google Drive.")
-              run_live([sys.executable, "-m", "gdown", GDRIVE_ID, "--continue", "--retries", "3", "--timeout", "60", "-O", str(file_path)], "Google Drive", "Downloading Google Drive file", 2700)
-              if not file_path.exists() or file_path.stat().st_size <= 0:
-                  raise RuntimeError("Google Drive download finished without creating a valid file.")
-              file_size = file_path.stat().st_size
-              print(f"Downloaded {FILE_NAME} ({file_size} bytes).")
-              report("progress", "Local file", "Download complete", f"Download complete. File size: {file_size} bytes.")
+              drive_url = f"https://drive.google.com/uc?id={GDRIVE_ID}"
+              downloaded_path = gdown.download(
+                  url=drive_url, output=None, quiet=False, fuzzy=True
+              )
+              if not downloaded_path or not os.path.isfile(downloaded_path):
+                  raise RuntimeError("Google Drive download failed or returned no file.")
 
-              platform_errors = []
+              file_path = os.path.abspath(downloaded_path)
+              file_name = os.path.basename(file_path)
+              file_size = os.path.getsize(file_path)
+              if file_size <= 0:
+                  raise RuntimeError("The downloaded file is empty.")
+              download_ok = True
+              print(
+                  f"::notice title=Downloaded::{file_name} "
+                  f"({round(file_size / (1024 ** 3), 3)} GB)"
+              )
+
               if NEED_PD:
-                  CURRENT_PLATFORM, CURRENT_STAGE = "Pixeldrain", "Uploading to Pixeldrain"
-                  if not PIXELDRAIN_API_KEY:
-                      platform_errors.append("Pixeldrain: API key is missing in WordPress settings.")
-                  else:
-                      upload_command = [
-                          "curl", "--fail-with-body", "--silent", "--show-error",
-                          "--retry", "2", "--retry-delay", "3", "--retry-all-errors",
-                          "--connect-timeout", "30", "--max-time", "2700",
-                          "--user", ":" + PIXELDRAIN_API_KEY,
-                          "-F", "file=@" + str(file_path),
-                          "https://pixeldrain.com/api/file/",
-                      ]
-                      try:
-                          _, pd_output = run_live(upload_command, "Pixeldrain", "Uploading file to Pixeldrain", 2700)
-                          pd_data = json.loads(pd_output.strip().splitlines()[-1])
-                          if not pd_data.get("success", True) or not pd_data.get("id"):
-                              raise RuntimeError(str(pd_data.get("message") or pd_data.get("value") or "Pixeldrain did not return a file ID."))
-                          PIXELDRAIN_URL = "https://pixeldrain.com/u/" + str(pd_data["id"])
-                          write_output("pixeldrain_url", PIXELDRAIN_URL)
-                          report("progress", "Pixeldrain", "Upload completed", "Pixeldrain upload completed successfully.")
-                      except Exception as exc:
-                          platform_errors.append("Pixeldrain: " + str(exc))
-                          write_output("error", str(exc))
+                  send_status("Uploading file to Pixeldrain", "pixeldrain", "Pixeldrain upload is in progress.")
+                  try:
+                      pixeldrain_url = upload_to_pixeldrain(file_path, file_name)
+                      pd_status = "success"
+                      print("::notice title=Pixeldrain Success::" + pixeldrain_url)
+                  except JobCancelled:
+                      raise
+                  except Exception as error:
+                      pd_status = "failed"
+                      errors.append("Pixeldrain: " + str(error))
+                      print("::error title=Pixeldrain Upload Failed::" + str(error))
+                      send_status("Pixeldrain upload failed", "pixeldrain", str(error)[:900])
 
               if NEED_MEGA:
-                  CURRENT_PLATFORM, CURRENT_STAGE = "MEGA", "Preparing multi-account rotation"
+                  send_status("Checking MEGA accounts and storage", "mega", "Checking configured MEGA accounts.")
                   try:
-                      if not shutil.which("mega-login") or not shutil.which("mega-put") or not shutil.which("mega-export"):
-                          raise RuntimeError("MEGAcmd was not installed correctly. Check the MEGA APT installation step.")
-                      upload_to_mega(file_path)
-                  except Exception as exc:
-                      platform_errors.append("MEGA: " + str(exc))
-                      write_output("error", str(exc))
+                      mega_url, used_mega_account = upload_to_mega(
+                          file_path, file_name, file_size
+                      )
+                      mega_status = "success"
+                      print("::notice title=MEGA Success::" + used_mega_account + " uploaded the file.")
+                  except JobCancelled:
+                      raise
+                  except Exception as error:
+                      mega_status = "failed"
+                      errors.append("MEGA: " + str(error))
+                      print("::error title=MEGA Upload Failed::" + str(error))
+                      send_status("MEGA upload failed", "mega", str(error)[:900])
 
-              write_output("file_name", FILE_NAME)
-              write_output("pixeldrain_url", PIXELDRAIN_URL)
-              write_output("mega_url", MEGA_URL)
-              write_output("mega_account", MEGA_ACCOUNT_USED)
-              if platform_errors:
-                  ERROR_MESSAGE = " | ".join(platform_errors)
-                  write_output("error", ERROR_MESSAGE)
-                  report("failed", "Workflow", "One or more platform uploads failed", ERROR_MESSAGE)
-                  raise RuntimeError(ERROR_MESSAGE)
+          except JobCancelled as cancelled:
+              print("::notice title=Cancelled::" + str(cancelled))
+              sys.exit(0)
+          except Exception as error:
+              errors.append("Source: " + str(error))
+              print("::error title=Mirror Job Failed::" + str(error))
+              if NEED_PD and pd_status == "pending":
+                  pd_status = "failed"
+              if NEED_MEGA and mega_status == "pending":
+                  mega_status = "failed"
 
-              report("progress", "All platforms", "Uploads finished", "All requested platform uploads completed successfully.")
-              print("All requested uploads completed successfully.")
-
-          except SystemExit:
-              raise
-          except Exception as exc:
-              ERROR_MESSAGE = str(exc)
-              write_output("error", ERROR_MESSAGE)
-              write_output("file_name", FILE_NAME)
-              write_output("pixeldrain_url", PIXELDRAIN_URL)
-              write_output("mega_url", MEGA_URL)
-              write_output("mega_account", MEGA_ACCOUNT_USED)
-              report("failed", CURRENT_PLATFORM, CURRENT_STAGE, ERROR_MESSAGE)
-              raise
-          PY
-
-      - name: Report final result to WordPress
-        if: always()
-        continue-on-error: true
-        timeout-minutes: 2
-        env:
-          FINAL_JOB_STATUS: ${{ job.status }}
-          REGISTER_CANCELLED: ${{ steps.register.outputs.cancelled }}
-          MIRROR_OUTCOME: ${{ steps.mirror.outcome }}
-          DEPENDENCIES_OUTCOME: ${{ steps.setup_deps.outcome }}
-          MIRROR_CANCELLED: ${{ steps.mirror.outputs.cancelled }}
-          FINAL_FILE_NAME: ${{ steps.mirror.outputs.file_name }}
-          FINAL_PIXELDRAIN_URL: ${{ steps.mirror.outputs.pixeldrain_url }}
-          FINAL_MEGA_URL: ${{ steps.mirror.outputs.mega_url }}
-          FINAL_MEGA_ACCOUNT: ${{ steps.mirror.outputs.mega_account }}
-          FINAL_ERROR: ${{ steps.mirror.outputs.error }}
-        run: |
-          python - <<'PY'
-          import json, os, urllib.request
-
-          status = os.environ.get("FINAL_JOB_STATUS", "failure")
-          if status == "cancelled" or os.environ.get("REGISTER_CANCELLED") == "true" or os.environ.get("MIRROR_CANCELLED") == "true":
-              action = "cancelled"
-          elif status == "success" and os.environ.get("MIRROR_OUTCOME") in ("success", "skipped"):
-              action = "completed"
-          else:
-              action = "failed"
-
-          final_error = os.environ.get("FINAL_ERROR", "")
-          if action == "failed" and not final_error and os.environ.get("DEPENDENCIES_OUTCOME") == "failure":
-              if os.environ.get("NEED_MEGA", "no") == "yes":
-                  final_error = "Runner dependency setup failed (Python packages or MEGAcmd). Open the GitHub run and inspect the conditional dependency-install step."
-              else:
-                  final_error = "Python download-package setup failed. MEGAcmd was intentionally skipped for this Pixeldrain-only run. Inspect the dependency-install step in GitHub Actions."
-          payload = {
-              "action": action,
-              "request_id": os.environ.get("REQUEST_ID", ""),
-              "post_id": os.environ.get("POST_ID", ""),
-              "gdrive_id": os.environ.get("GDRIVE_ID", ""),
-              "file_name": os.environ.get("FINAL_FILE_NAME") or os.environ.get("POST_TITLE", ""),
-              "run_id": os.environ.get("RUN_ID", ""),
-              "run_number": os.environ.get("RUN_NUMBER", ""),
-              "run_url": os.environ.get("RUN_URL", ""),
-              "need_pd": os.environ.get("NEED_PD", "yes"),
-              "need_mega": os.environ.get("NEED_MEGA", "yes"),
-              "platform": "Workflow",
-              "stage": "Workflow " + action,
-              "message": final_error or ("All requested uploads completed." if action == "completed" else "Workflow was cancelled." if action == "cancelled" else "Workflow failed; open GitHub run logs for the failing step."),
-              "pixeldrain_url": os.environ.get("FINAL_PIXELDRAIN_URL", ""),
-              "mega_url": os.environ.get("FINAL_MEGA_URL", ""),
-              "mega_account": os.environ.get("FINAL_MEGA_ACCOUNT", ""),
-              "webhook_secret": os.environ.get("WEBHOOK_SECRET", ""),
-          }
-          payload["pixeldrain_url"] = os.environ.get("FINAL_PIXELDRAIN_URL", "")
-          data = json.dumps(payload).encode()
-          request = urllib.request.Request(os.environ.get("CALLBACK_URL", ""), data=data, headers={"Content-Type": "application/json"}, method="POST")
+          # Always report final target-specific results. Unrequested destinations stay skipped.
           try:
-              with urllib.request.urlopen(request, timeout=20) as response:
-                  print("WordPress final callback status:", response.status)
-          except Exception as exc:
-              print("Final callback warning:", exc)
-          PY
+              send_status("Sending final results to WordPress", "WordPress", "Saving platform links and completing queue record.")
+              if NEED_PD and pd_status == "pending":
+                  pd_status = "failed"
+              if NEED_MEGA and mega_status == "pending":
+                  mega_status = "failed"
+              send_final_callback(
+                  file_name, pixeldrain_url, mega_url, used_mega_account,
+                  pd_status, mega_status,
+                  "; ".join(errors) if errors else "Requested upload destination(s) processed."
+              )
+          except JobCancelled as cancelled:
+              print("::notice title=Cancelled::" + str(cancelled))
+              sys.exit(0)
+          except Exception as error:
+              print("::error title=WordPress Callback Failed::" + str(error))
+              sys.exit(1)
+
+          success = (not NEED_PD or pd_status == "success") and (not NEED_MEGA or mega_status == "success") and download_ok
+          if not success:
+              sys.exit(1)
