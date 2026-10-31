@@ -37,6 +37,7 @@ jobs:
           QUEUE_ID: ${{ github.event.client_payload.queue_id }}
           RUN_ID: ${{ github.run_id }}
           STATUS_URL: ${{ github.event.client_payload.status_url }}
+          PLATFORM_RESULT_URL: ${{ github.event.client_payload.platform_result_url }}
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
         run: |
           python - <<'PY'
@@ -99,6 +100,7 @@ jobs:
           NEED_MEGA: ${{ github.event.client_payload.need_mega }}
           CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
           STATUS_URL: ${{ github.event.client_payload.status_url }}
+          PLATFORM_RESULT_URL: ${{ github.event.client_payload.platform_result_url }}
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
           PIXELDRAIN_API: ${{ github.event.client_payload.pixeldrain_api }}
           MEGA_ACCOUNTS: ${{ github.event.client_payload.mega_accounts }}
@@ -110,6 +112,7 @@ jobs:
           import urllib.parse
           import requests
           import gdown
+          import time
 
           QUEUE_ID = os.environ.get("QUEUE_ID", "").strip()
           RUN_ID = os.environ.get("RUN_ID", "").strip()
@@ -119,6 +122,7 @@ jobs:
           NEED_MEGA = os.environ.get("NEED_MEGA", "no").strip().lower() == "yes"
           CALLBACK_URL = os.environ.get("CALLBACK_URL", "").strip()
           STATUS_URL = os.environ.get("STATUS_URL", "").strip()
+          PLATFORM_RESULT_URL = os.environ.get("PLATFORM_RESULT_URL", "").strip()
           WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
           PIXELDRAIN_API = os.environ.get("PIXELDRAIN_API", "").strip()
           MEGA_ACCOUNTS_RAW = os.environ.get("MEGA_ACCOUNTS", "").strip()
@@ -127,6 +131,10 @@ jobs:
           os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
           class JobCancelled(Exception):
+              pass
+
+          class RemoteUploadStateUnknown(RuntimeError):
+              """Stop failover when a remote upload may already have completed."""
               pass
 
           def send_status(stage, platform="", message=""):
@@ -176,6 +184,117 @@ jobs:
               response.raise_for_status()
               print("WordPress callback accepted:", response.status_code)
 
+          def report_platform_result(platform, url, account="", message=""):
+              """Persist each successful/reused remote link before proceeding."""
+              if not PLATFORM_RESULT_URL or not QUEUE_ID:
+                  return False, "Partial platform callback URL is not configured."
+
+              payload = {
+                  "webhook_secret": WEBHOOK_SECRET,
+                  "queue_id": QUEUE_ID,
+                  "post_id": POST_ID,
+                  "platform": platform,
+                  "url": url,
+                  "file_name": file_name,
+                  "account": account,
+                  "message": message,
+              }
+              last_error = "Unknown WordPress callback error."
+              for attempt in range(1, 4):
+                  try:
+                      response = requests.post(
+                          PLATFORM_RESULT_URL,
+                          json=payload,
+                          headers={"User-Agent": "CLOBD-GitHub-Actions-Mirror"},
+                          timeout=45,
+                      )
+                      if response.status_code == 409:
+                          raise JobCancelled("The queue job was cancelled in WordPress.")
+                      response.raise_for_status()
+                      try:
+                          result = response.json()
+                      except ValueError:
+                          result = {}
+                      if result.get("cancelled"):
+                          raise JobCancelled("The queue job was cancelled in WordPress after saving the completed platform link.")
+                      print(f"WordPress saved {platform} result immediately (HTTP {response.status_code}).")
+                      return True, ""
+                  except JobCancelled:
+                      raise
+                  except Exception as error:
+                      last_error = str(error)
+                      print(f"::warning:: Partial {platform} callback attempt {attempt}/3 failed: {last_error}")
+                      if attempt < 3:
+                          time.sleep(attempt * 3)
+              return False, last_error
+
+          def find_existing_pixeldrain_file(file_name):
+              """Find and reuse an exact, case-sensitive filename in the account."""
+              if not PIXELDRAIN_API:
+                  raise RuntimeError("Pixeldrain API key is not configured; cannot safely check duplicates.")
+
+              response = requests.get(
+                  "https://pixeldrain.com/api/user/files",
+                  auth=("", PIXELDRAIN_API),
+                  headers={"Accept": "application/json"},
+                  timeout=(20, 90),
+              )
+              if response.status_code != 200:
+                  raise RuntimeError(
+                      f"Could not inspect the Pixeldrain account file list (HTTP {response.status_code}). "
+                      "Upload was stopped to avoid creating a duplicate."
+                  )
+              try:
+                  data = response.json()
+              except ValueError as error:
+                  raise RuntimeError("Pixeldrain account file-list response was not valid JSON; upload was stopped.") from error
+
+              files = data.get("files") if isinstance(data, dict) else None
+              if not isinstance(files, list):
+                  raise RuntimeError("Pixeldrain account file list did not contain a files array; upload was stopped safely.")
+
+              exact_matches = [
+                  item for item in files
+                  if isinstance(item, dict)
+                  and item.get("name") == file_name
+                  and item.get("id")
+              ]
+              print(f"Pixeldrain account inventory checked: {len(files)} file entries; exact filename matches: {len(exact_matches)}.")
+
+              verification_errors = []
+              for item in exact_matches:
+                  file_id = str(item["id"]).strip()
+                  info_response = requests.get(
+                      f"https://pixeldrain.com/api/file/{urllib.parse.quote(file_id, safe='')}/info",
+                      headers={"Accept": "application/json"},
+                      timeout=(15, 45),
+                  )
+                  # A confirmed 404 means this stale list entry is no longer available.
+                  if info_response.status_code == 404:
+                      continue
+                  if info_response.status_code != 200:
+                      verification_errors.append(
+                          f"Could not verify exact-name PixelDrain file {file_id} (HTTP {info_response.status_code})."
+                      )
+                      continue
+                  try:
+                      info = info_response.json()
+                  except ValueError:
+                      verification_errors.append(f"PixelDrain metadata for exact-name file {file_id} was not valid JSON.")
+                      continue
+
+                  if info.get("id") and info.get("name") == file_name:
+                      return "https://pixeldrain.com/u/" + file_id
+                  if "name" not in info:
+                      verification_errors.append(f"PixelDrain did not return a filename for exact-name candidate {file_id}.")
+
+              if verification_errors:
+                  raise RuntimeError(
+                      "PixelDrain exact-name candidate(s) could not be verified. No upload was started to avoid duplicates. "
+                      + " | ".join(verification_errors[:5])
+                  )
+              return None
+
           def get_mega_used_bytes():
               result = subprocess.run(
                   ["mega-df"], capture_output=True, text=True, timeout=60
@@ -219,50 +338,165 @@ jobs:
                   )
               return "https://pixeldrain.com/u/" + str(data["id"])
 
-          def upload_to_mega(file_path, file_name, file_size):
-              accounts = [
+          def mega_accounts():
+              return [
                   line.strip()
                   for line in MEGA_ACCOUNTS_RAW.splitlines()
                   if ":" in line.strip()
               ]
+
+          def mega_logout():
+              subprocess.run(
+                  ["mega-logout"],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+                  timeout=30,
+              )
+
+          def export_mega_link(remote_path):
+              export_result = subprocess.run(
+                  ["mega-export", "-a", remote_path],
+                  capture_output=True,
+                  text=True,
+                  timeout=180,
+              )
+              if export_result.returncode != 0:
+                  raise RuntimeError(
+                      f"MEGA file exists but link export failed: {(export_result.stderr or export_result.stdout)[:700]}"
+                  )
+              match = re.search(r"(https://mega\.nz/\S+)", export_result.stdout or "")
+              if not match:
+                  raise RuntimeError("MEGA file exists, but mega-export did not return a public link.")
+              return match.group(1).rstrip("\r\n")
+
+          def find_exact_mega_path_for_current_account(file_name):
+              """Return one exact basename match in the currently logged-in account."""
+              find_result = subprocess.run(
+                  ["mega-find", "/", "--type=f"],
+                  capture_output=True,
+                  text=True,
+                  timeout=600,
+              )
+              if find_result.returncode != 0:
+                  raise RemoteUploadStateUnknown(
+                      "MEGA exact-name verification failed: "
+                      + (find_result.stderr or find_result.stdout or "mega-find returned a non-zero status")[:700]
+                  )
+
+              for raw_line in (find_result.stdout or "").splitlines():
+                  remote_path = raw_line.strip().strip('"')
+                  if not remote_path.startswith("/"):
+                      continue
+                  # Deliberately case-sensitive and basename-exact; no partial matching.
+                  if os.path.basename(remote_path.rstrip("/")) == file_name:
+                      return remote_path
+              return None
+
+          def find_existing_mega_file(file_name):
+              """Search every configured MEGA account before any new MEGA upload."""
+              accounts = mega_accounts()
               if not accounts:
                   raise RuntimeError("No MEGA accounts are configured in WordPress.")
 
-              max_limit_bytes = int(19.8 * (1024 ** 3))
-              last_error = "No MEGA account had enough storage or could upload."
-
+              scan_errors = []
               for index, account in enumerate(accounts, start=1):
                   email, password = account.split(":", 1)
                   email = email.strip()
                   password = password.strip()
-                  print(f"Checking MEGA account {index}/{len(accounts)}: {email}")
-                  subprocess.run(
-                      ["mega-logout"], stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL, timeout=30
-                  )
+                  print(f"Checking exact filename in MEGA account {index}/{len(accounts)}: {email}")
+                  mega_logout()
 
                   try:
                       login = subprocess.run(
                           ["mega-login", email, password],
-                          capture_output=True, text=True, timeout=90
+                          capture_output=True,
+                          text=True,
+                          timeout=120,
+                      )
+                      if login.returncode != 0:
+                          scan_errors.append(
+                              f"Could not inspect MEGA account {email}: {(login.stderr or login.stdout)[:400]}"
+                          )
+                          continue
+
+                      exact_path = find_exact_mega_path_for_current_account(file_name)
+                      if exact_path:
+                          try:
+                              link = export_mega_link(exact_path)
+                          except Exception as export_error:
+                              scan_errors.append(
+                                  f"Exact-name MEGA file found in {email} at {exact_path}, but its link could not be exported: {export_error}"
+                              )
+                              continue
+                          print(
+                              f"::notice title=MEGA Duplicate Found::Exact filename already exists in {email}; reusing {exact_path}."
+                          )
+                          return link, email
+                      print(f"No exact filename match found in {email}.")
+
+                  except JobCancelled:
+                      raise
+                  except RemoteUploadStateUnknown:
+                      raise
+                  except Exception as error:
+                      scan_errors.append(f"Could not safely scan MEGA account {email}: {error}")
+                  finally:
+                      mega_logout()
+
+              # A failed account scan must never be interpreted as 'file absent'.
+              if scan_errors:
+                  raise RuntimeError(
+                      "MEGA duplicate check was incomplete. No new MEGA upload was started to avoid duplicates. "
+                      + " | ".join(scan_errors[:5])
+                  )
+              return None
+
+          def upload_to_mega(file_path, file_name, file_size):
+              accounts = mega_accounts()
+              if not accounts:
+                  raise RuntimeError("No MEGA accounts are configured in WordPress.")
+
+              # First pass: inspect ALL accounts. If an exact filename exists
+              # anywhere, reuse it and do not upload or delete anything.
+              existing = find_existing_mega_file(file_name)
+              if existing:
+                  return existing[0], existing[1], True
+
+              max_limit_bytes = int(19.8 * (1024 ** 3))
+              last_error = "No MEGA account had enough storage or could upload."
+
+              # Second pass: choose an account only after all duplicate scans succeed.
+              for index, account in enumerate(accounts, start=1):
+                  email, password = account.split(":", 1)
+                  email = email.strip()
+                  password = password.strip()
+                  print(f"Checking MEGA storage {index}/{len(accounts)}: {email}")
+                  mega_logout()
+
+                  try:
+                      login = subprocess.run(
+                          ["mega-login", email, password],
+                          capture_output=True,
+                          text=True,
+                          timeout=120,
                       )
                       if login.returncode != 0:
                           last_error = f"MEGA login failed for {email}: {(login.stderr or login.stdout)[:500]}"
                           print("::warning::", last_error)
                           continue
 
-                      # Keep the existing rubbish-bin cleanup behaviour.
+                      # Preserve the existing rubbish-bin cleanup behaviour.
                       subprocess.run(
                           ["mega-rm", "-r", "-f", "//bin/*"],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                          timeout=120
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL,
+                          timeout=180,
                       )
 
                       used_bytes = get_mega_used_bytes()
                       if used_bytes is None:
-                          last_error = f"Could not read MEGA storage for {email}; trying next account."
+                          last_error = f"Could not read MEGA storage for {email}; trying the next account."
                           print("::warning::", last_error)
-                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                           continue
 
                       projected_bytes = used_bytes + file_size
@@ -274,57 +508,77 @@ jobs:
                       )
 
                       if projected_bytes > max_limit_bytes:
-                          last_error = f"Not enough available storage in {email}; trying next account."
+                          last_error = f"Not enough available storage in {email}; trying the next account."
                           print("::notice::", last_error)
-                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                           continue
 
-                      send_status("Uploading file to MEGA", "mega", f"Uploading to {email}")
-                      remote_path = "/" + file_name
-                      subprocess.run(
-                          ["mega-rm", "-f", remote_path],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                          timeout=60
-                      )
-                      put_result = subprocess.run(
-                          ["mega-put", file_path, "/"],
-                          capture_output=True, text=True, timeout=7200
-                      )
+                      send_status("Uploading file to MEGA", "mega", f"Uploading to {email}; exact-name scan found no existing copy in configured accounts.")
+
+                      # No mega-rm is performed here. A same-name remote file must
+                      # never be deleted or overwritten.
+                      try:
+                          put_result = subprocess.run(
+                              ["mega-put", file_path, "/"],
+                              capture_output=True,
+                              text=True,
+                              timeout=7200,
+                          )
+                      except subprocess.TimeoutExpired as timeout_error:
+                          # The daemon may still have completed or be completing the
+                          # upload. Do not fail over to another account on uncertainty.
+                          raise RemoteUploadStateUnknown(
+                              f"MEGA upload to {email} timed out. The remote result is uncertain; "
+                              "no other account was attempted. Run the job again after checking the account."
+                          ) from timeout_error
+
                       if put_result.returncode != 0:
-                          last_error = f"MEGA upload failed for {email}: {(put_result.stderr or put_result.stdout)[:700]}"
+                          last_error = f"MEGA upload command returned an error for {email}: {(put_result.stderr or put_result.stdout)[:700]}"
                           print("::warning::", last_error)
-                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          try:
+                              matching_path = find_exact_mega_path_for_current_account(file_name)
+                          except Exception as verify_error:
+                              raise RemoteUploadStateUnknown(
+                                  f"MEGA upload on {email} returned an error and its remote result could not be verified. "
+                                  "No other account was attempted to prevent a duplicate. " + str(verify_error)
+                              ) from verify_error
+
+                          if matching_path:
+                              try:
+                                  link = export_mega_link(matching_path)
+                              except Exception as export_error:
+                                  raise RemoteUploadStateUnknown(
+                                      f"MEGA contains the exact file in {email}, but its share link could not be exported. "
+                                      "No other account was attempted. " + str(export_error)
+                                  ) from export_error
+                              return link, email, True
+
+                          # A successful verification found no remote file, so it is
+                          # safe to try the next configured account.
                           continue
 
-                      export_result = subprocess.run(
-                          ["mega-export", "-a", remote_path],
-                          capture_output=True, text=True, timeout=120
-                      )
-                      if export_result.returncode != 0:
-                          last_error = f"MEGA export failed for {email}: {(export_result.stderr or export_result.stdout)[:700]}"
-                          print("::warning::", last_error)
-                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                          continue
+                      remote_path = "/" + file_name
+                      try:
+                          link = export_mega_link(remote_path)
+                      except Exception as export_error:
+                          # Upload returned success. Never upload a second copy just
+                          # because publishing the share link failed.
+                          raise RemoteUploadStateUnknown(
+                              f"MEGA upload succeeded in {email}, but public-link export failed. "
+                              "The file has been kept; no other account was attempted. " + str(export_error)
+                          ) from export_error
 
-                      match = re.search(r"(https://mega\.nz/\S+)", export_result.stdout or "")
-                      if not match:
-                          last_error = f"MEGA uploaded to {email}, but no public link was returned."
-                          print("::warning::", last_error)
-                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                          continue
-
-                      link = match.group(1).rstrip("\r\n")
-                      subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                      return link, email
+                      print(f"::notice title=MEGA Upload Success::{email} uploaded {file_name} ({projected_gb} / 19.8 GB used).")
+                      return link, email, False
 
                   except JobCancelled:
-                      subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      raise
+                  except RemoteUploadStateUnknown:
                       raise
                   except Exception as error:
                       last_error = f"MEGA account {email} error: {error}"
                       print("::warning::", last_error)
-                      subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                      continue
+                  finally:
+                      mega_logout()
 
               raise RuntimeError(last_error)
 
@@ -341,6 +595,8 @@ jobs:
           try:
               if not POST_ID or not GDRIVE_ID:
                   raise RuntimeError("Post ID or Google Drive file ID is missing.")
+              if QUEUE_ID and not PLATFORM_RESULT_URL:
+                  raise RuntimeError("WordPress per-platform result URL is missing. Refusing to upload without immediate link persistence.")
               if not NEED_PD and not NEED_MEGA:
                   raise RuntimeError("No upload destination was selected for this queue job.")
 
@@ -371,34 +627,62 @@ jobs:
               )
 
               if NEED_PD:
-                  send_status("Uploading file to Pixeldrain", "pixeldrain", "Pixeldrain upload is in progress.")
                   try:
-                      pixeldrain_url = upload_to_pixeldrain(file_path, file_name)
-                      pd_status = "success"
-                      print("::notice title=Pixeldrain Success::" + pixeldrain_url)
+                      send_status("Checking Pixeldrain for exact filename", "pixeldrain", "Searching the authenticated PixelDrain account before upload.")
+                      existing_pd_url = find_existing_pixeldrain_file(file_name)
+                      if existing_pd_url:
+                          pixeldrain_url = existing_pd_url
+                          pd_status = "success"
+                          pd_message = "Exact filename already existed in the PixelDrain account; reused the existing link without uploading a duplicate."
+                          print("::notice title=PixelDrain Duplicate Found::" + pixeldrain_url)
+                      else:
+                          send_status("Uploading file to Pixeldrain", "pixeldrain", "No exact filename match exists; uploading to PixelDrain.")
+                          pixeldrain_url = upload_to_pixeldrain(file_path, file_name)
+                          pd_status = "success"
+                          pd_message = "PixelDrain upload completed successfully."
+                          print("::notice title=Pixeldrain Success::" + pixeldrain_url)
+
+                      saved, save_error = report_platform_result(
+                          "pixeldrain", pixeldrain_url, "", pd_message
+                      )
+                      if not saved:
+                          errors.append("PixelDrain link was obtained but the immediate WordPress save failed: " + save_error)
+                          print("::warning:: PixelDrain link will be included in the final callback; immediate persistence failed.")
                   except JobCancelled:
                       raise
                   except Exception as error:
                       pd_status = "failed"
                       errors.append("Pixeldrain: " + str(error))
-                      print("::error title=Pixeldrain Upload Failed::" + str(error))
-                      send_status("Pixeldrain upload failed", "pixeldrain", str(error)[:900])
+                      print("::error title=Pixeldrain Failed::" + str(error))
+                      send_status("Pixeldrain check/upload failed", "pixeldrain", str(error)[:900])
 
               if NEED_MEGA:
-                  send_status("Checking MEGA accounts and storage", "mega", "Checking configured MEGA accounts.")
                   try:
-                      mega_url, used_mega_account = upload_to_mega(
+                      send_status("Checking all MEGA accounts for exact filename", "mega", "Searching every configured MEGA account before uploading.")
+                      mega_url, used_mega_account, mega_was_existing = upload_to_mega(
                           file_path, file_name, file_size
                       )
                       mega_status = "success"
-                      print("::notice title=MEGA Success::" + used_mega_account + " uploaded the file.")
+                      if mega_was_existing:
+                          mega_message = "Exact filename already existed in a configured MEGA account; reused the existing link without uploading a duplicate."
+                          print("::notice title=MEGA Duplicate Found::Reusing existing file in " + used_mega_account)
+                      else:
+                          mega_message = "MEGA upload completed successfully."
+                          print("::notice title=MEGA Success::" + used_mega_account + " uploaded the file.")
+
+                      saved, save_error = report_platform_result(
+                          "mega", mega_url, used_mega_account, mega_message
+                      )
+                      if not saved:
+                          errors.append("MEGA link was obtained but the immediate WordPress save failed: " + save_error)
+                          print("::warning:: MEGA link will be included in the final callback; immediate persistence failed.")
                   except JobCancelled:
                       raise
                   except Exception as error:
                       mega_status = "failed"
                       errors.append("MEGA: " + str(error))
-                      print("::error title=MEGA Upload Failed::" + str(error))
-                      send_status("MEGA upload failed", "mega", str(error)[:900])
+                      print("::error title=MEGA Failed::" + str(error))
+                      send_status("MEGA check/upload failed", "mega", str(error)[:900])
 
           except JobCancelled as cancelled:
               print("::notice title=Cancelled::" + str(cancelled))
