@@ -1,4 +1,5 @@
 name: CLOBD Sequential Pixeldrain Upload Queue
+run-name: "CLOBD Queue Job #${{ github.event.client_payload.job_id }} | ${{ github.event.client_payload.platform }}"
 
 on:
   repository_dispatch:
@@ -16,6 +17,46 @@ jobs:
     timeout-minutes: 120
 
     steps:
+      # Register the GitHub run ID before checkout/dependency installation.
+      # This lets WordPress detect failures that happen before the uploader runs.
+      - name: Register GitHub Run with WordPress
+        shell: bash
+        env:
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+          PROGRESS_URL: ${{ github.event.client_payload.progress_url }}
+          WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+          import urllib.error
+
+          url = os.environ.get("PROGRESS_URL", "").strip()
+          payload = {
+              "webhook_secret": os.environ.get("WEBHOOK_SECRET", ""),
+              "job_id": os.environ.get("JOB_ID", ""),
+              "stage": "starting",
+              "message": "GitHub Actions runner registered. Preparing the upload job.",
+              "github_run_id": os.environ.get("GH_RUN_ID", ""),
+          }
+          if not url:
+              print("::warning::WordPress progress URL is missing; WordPress will locate this run through the GitHub API.")
+          else:
+              request = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={"Content-Type": "application/json", "Accept": "application/json"},
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      print(f"WordPress run registration: HTTP {response.status}")
+              except Exception as error:
+                  print(f"::warning::Could not register GitHub run with WordPress: {error}")
+          PY
+
       - name: Checkout Repository
         uses: actions/checkout@v4
 
@@ -266,3 +307,49 @@ jobs:
                       print(f"::error title=WordPress Failure Callback::{callback_error}")
 
               sys.exit(1)
+
+      # Covers failures before the upload script starts (checkout, pip install,
+      # runner cancellation, timeout, etc.). Duplicate callbacks are harmless:
+      # WordPress ignores jobs that are already in a terminal state.
+      - name: Report workflow failure or cancellation to WordPress
+        if: ${{ always() && job.status != 'success' }}
+        shell: bash
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+          POST_ID: ${{ github.event.client_payload.post_id }}
+          JOB_STATUS: ${{ job.status }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          url = os.environ.get("CALLBACK_URL", "").strip()
+          status = os.environ.get("JOB_STATUS", "failure").strip().lower()
+          result_status = "cancelled" if status == "cancelled" else "failed"
+          payload = {
+              "webhook_secret": os.environ.get("WEBHOOK_SECRET", ""),
+              "job_id": os.environ.get("JOB_ID", ""),
+              "post_id": os.environ.get("POST_ID", ""),
+              "result_status": result_status,
+              "message": f"GitHub Actions ended with job status: {status}. This fallback callback was sent so the queue can continue.",
+          }
+          if not url:
+              print("::warning::WordPress callback URL is missing; the queue watchdog will reconcile this run through GitHub.")
+          else:
+              request = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={"Content-Type": "application/json", "Accept": "application/json"},
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      print(f"WordPress fallback callback: HTTP {response.status}")
+              except Exception as error:
+                  print(f"::error::Could not send fallback callback to WordPress: {error}")
+          PY
+
