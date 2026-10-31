@@ -20,7 +20,7 @@ permissions:
 jobs:
   mirror_file:
     if: github.event.action == 'mirror_gdrive_file'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 360
 
     steps:
@@ -84,10 +84,19 @@ jobs:
       - name: Install Python Dependencies and MEGAcmd
         if: steps.report_queue.outputs.cancelled != 'true'
         run: |
-          python3 -m pip install --upgrade pip "gdown>=6.3,<7" requests
-          wget -q "https://mega.nz/linux/repo/xUbuntu_24.04/amd64/megacmd-xUbuntu_24.04_amd64.deb"
+          python3 -m pip install --upgrade pip "gdown==6.5.1" requests
+          wget -q "https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb"
           sudo apt-get update
-          sudo apt-get install -y "./megacmd-xUbuntu_24.04_amd64.deb" || sudo apt-get install -f -y
+          sudo apt-get install -y "./megacmd-xUbuntu_22.04_amd64.deb" || sudo apt-get install -f -y
+
+      - name: Record runner diagnostics
+        if: steps.report_queue.outputs.cancelled != 'true'
+        run: |
+          echo "Runner image: ubuntu-22.04"
+          echo "GitHub run: $GITHUB_RUN_ID / attempt $GITHUB_RUN_ATTEMPT"
+          date -u
+          cat /etc/os-release | head -n 8
+          df -h "$GITHUB_WORKSPACE"
 
       - name: Download from Google Drive and Upload Selected Backups
         if: steps.report_queue.outputs.cancelled != 'true'
@@ -114,6 +123,7 @@ jobs:
           import requests
           import gdown
           import time
+          import threading
 
           QUEUE_ID = os.environ.get("QUEUE_ID", "").strip()
           RUN_ID = os.environ.get("RUN_ID", "").strip()
@@ -145,9 +155,9 @@ jobs:
               pass
 
           def send_status(stage, platform="", message=""):
-              """Send live stage/platform information to the WordPress Queue page."""
+              """Best-effort live telemetry; only an explicit WordPress cancel stops the worker."""
               if not STATUS_URL or not QUEUE_ID:
-                  return
+                  return False
               payload = {
                   "webhook_secret": WEBHOOK_SECRET,
                   "queue_id": QUEUE_ID,
@@ -156,15 +166,28 @@ jobs:
                   "platform": platform,
                   "message": message,
               }
-              response = requests.post(STATUS_URL, json=payload, timeout=25)
-              if response.status_code == 409:
-                  raise JobCancelled("This job was cancelled from the WordPress dashboard.")
-              response.raise_for_status()
-              try:
-                  if response.json().get("cancelled"):
-                      raise JobCancelled("This job was cancelled from the WordPress dashboard.")
-              except ValueError:
-                  pass
+              last_error = None
+              for status_attempt in range(1, 4):
+                  try:
+                      response = requests.post(STATUS_URL, json=payload, timeout=20)
+                      if response.status_code == 409:
+                          raise JobCancelled("This job was cancelled from the WordPress dashboard.")
+                      response.raise_for_status()
+                      try:
+                          if response.json().get("cancelled"):
+                              raise JobCancelled("This job was cancelled from the WordPress dashboard.")
+                      except ValueError:
+                          pass
+                      return True
+                  except JobCancelled:
+                      raise
+                  except Exception as status_error:
+                      last_error = status_error
+                      print(f"::warning::WordPress progress update {status_attempt}/3 failed: {status_error}", flush=True)
+                      if status_attempt < 3:
+                          time.sleep(status_attempt * 2)
+              print(f"::warning::Continuing transfer despite temporary WordPress telemetry failure: {last_error}", flush=True)
+              return False
 
           def send_final_callback(file_name, pd_url, mega_url, mega_account,
                                  pd_status, mega_status, message="", mega_remote_path=""):
@@ -636,29 +659,64 @@ jobs:
                   send_status("Downloading source from Google Drive", "Google Drive", "Downloading only because at least one selected platform has no exact indexed match.")
                   safe_name = os.path.basename(file_name)
                   output_path = os.path.join(DOWNLOAD_DIR, safe_name)
-                  last_progress_update = [time.monotonic()]
                   last_percent = [-1]
+                  progress_state = {"bytes_done": 0, "bytes_total": None}
+                  download_heartbeat_stop = threading.Event()
+                  download_cancel_event = threading.Event()
 
                   def on_download_progress(bytes_done, bytes_total):
-                      now = time.monotonic()
+                      progress_state["bytes_done"] = int(bytes_done)
+                      progress_state["bytes_total"] = (int(bytes_total) if bytes_total is not None else None)
                       percent = int((bytes_done / bytes_total) * 100) if bytes_total else -1
                       if percent >= 0 and percent != last_percent[0] and (percent % 5 == 0):
-                          print(f"Download progress: {percent}% ({bytes_done}/{bytes_total} bytes)")
+                          print(f"Download progress: {percent}% ({bytes_done}/{bytes_total} bytes)", flush=True)
                           last_percent[0] = percent
-                      if now - last_progress_update[0] >= 25:
-                          stage = (f"Downloading source from Google Drive ({percent}%)" if percent >= 0 else "Downloading source from Google Drive")
-                          send_status(stage, "Google Drive", f"Downloaded {bytes_done} bytes; automatic retry/resume is enabled.")
-                          last_progress_update[0] = now
 
-                  downloaded_path = gdown.download(
-                      url=drive_url,
-                      output=output_path,
-                      quiet=False,
-                      resume=True,
-                      retries=5,
-                      timeout=(30, 120),
-                      progress=on_download_progress,
+                  def download_status_heartbeat():
+                      # Independent heartbeat keeps WordPress updated even when
+                      # gdown is waiting for a slow HTTP response between chunks.
+                      while not download_heartbeat_stop.wait(20):
+                          done = progress_state["bytes_done"]
+                          total = progress_state["bytes_total"]
+                          percent = int((done / total) * 100) if total else None
+                          stage = (f"Downloading source from Google Drive ({percent}%)"
+                                   if percent is not None else "Downloading source from Google Drive")
+                          try:
+                              send_status(
+                                  stage,
+                                  "Google Drive",
+                                  f"Downloaded {done} bytes so far; gdown retries/resume are enabled. Runner heartbeat is active."
+                              )
+                          except JobCancelled:
+                              download_cancel_event.set()
+                              return
+
+                  heartbeat_thread = threading.Thread(
+                      target=download_status_heartbeat,
+                      name="clobd-download-heartbeat",
+                      daemon=True,
                   )
+                  heartbeat_thread.start()
+                  try:
+                      downloaded_path = gdown.download(
+                          url=drive_url,
+                          output=output_path,
+                          quiet=False,
+                          resume=True,
+                          retries=5,
+                          timeout=(30, 120),
+                          progress=on_download_progress,
+                          cancel=download_cancel_event,
+                      )
+                  except Exception:
+                      if download_cancel_event.is_set():
+                          raise JobCancelled("Download stopped because this queue job was cancelled in WordPress.")
+                      raise
+                  finally:
+                      download_heartbeat_stop.set()
+                      heartbeat_thread.join(timeout=5)
+                  if download_cancel_event.is_set():
+                      raise JobCancelled("Download stopped because this queue job was cancelled in WordPress.")
                   if not downloaded_path or not os.path.isfile(downloaded_path):
                       raise RuntimeError("Google Drive download failed or returned no file after automatic retries.")
                   file_path = os.path.abspath(downloaded_path)
@@ -742,7 +800,7 @@ jobs:
 
   cloud_index_sync:
     if: github.event.action == 'sync_cloud_index'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 360
     steps:
       - name: Checkout Repository
@@ -756,9 +814,17 @@ jobs:
       - name: Install MEGAcmd and Python Dependencies
         run: |
           python3 -m pip install --upgrade pip requests
-          wget -q "https://mega.nz/linux/repo/xUbuntu_24.04/amd64/megacmd-xUbuntu_24.04_amd64.deb"
+          wget -q "https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb"
           sudo apt-get update
-          sudo apt-get install -y "./megacmd-xUbuntu_24.04_amd64.deb" || sudo apt-get install -f -y
+          sudo apt-get install -y "./megacmd-xUbuntu_22.04_amd64.deb" || sudo apt-get install -f -y
+
+      - name: Record index runner diagnostics
+        run: |
+          echo "Runner image: ubuntu-22.04"
+          echo "GitHub run: $GITHUB_RUN_ID / attempt $GITHUB_RUN_ATTEMPT"
+          date -u
+          cat /etc/os-release | head -n 8
+          df -h "$GITHUB_WORKSPACE"
 
       - name: Build PixelDrain and MEGA Cloud File Index
         shell: python
