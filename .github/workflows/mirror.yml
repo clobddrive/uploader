@@ -1,13 +1,8 @@
-name: Auto Mirror Google Drive to Cloud (1-by-1 Queue & Live Progress)
+name: Auto Mirror Google Drive to Cloud
 
 on:
   repository_dispatch:
     types: [mirror_gdrive_file]
-
-# Ensures strictly 1 job runs at a time on GitHub even if multiple signals arrive
-concurrency:
-  group: clobd-single-upload-queue
-  cancel-in-progress: false
 
 jobs:
   mirror_file:
@@ -30,94 +25,54 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y "./megacmd-xUbuntu_24.04_amd64.deb" || sudo apt-get install -f -y
 
-      - name: Run Auto Upload Script with Live Dashboard Progress
+      - name: Run Auto Upload Script
         shell: python
         env:
-          GITHUB_RUN_ID: ${{ github.run_id }}
           POST_ID: ${{ github.event.client_payload.post_id }}
           GDRIVE_ID: ${{ github.event.client_payload.gdrive_id }}
           NEED_PD: ${{ github.event.client_payload.need_pd }}
           NEED_MEGA: ${{ github.event.client_payload.need_mega }}
           CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
-          PROGRESS_URL: ${{ github.event.client_payload.progress_url }}
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
           PIXELDRAIN_API: ${{ github.event.client_payload.pixeldrain_api }}
           MEGA_ACCOUNTS: ${{ github.event.client_payload.mega_accounts }}
         run: |
           import os, sys, re, subprocess, urllib.parse, requests, gdown
 
-          RUN_ID = os.environ.get("GITHUB_RUN_ID", "").strip()
           POST_ID = os.environ.get("POST_ID", "").strip()
           GDRIVE_ID = os.environ.get("GDRIVE_ID", "").strip()
           NEED_PD = os.environ.get("NEED_PD", "yes").strip()
           NEED_MEGA = os.environ.get("NEED_MEGA", "yes").strip()
           CALLBACK_URL = os.environ.get("CALLBACK_URL", "").strip()
-          PROGRESS_URL = os.environ.get("PROGRESS_URL", "").strip()
           WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
           PIXELDRAIN_API = os.environ.get("PIXELDRAIN_API", "").strip()
           MEGA_ACCOUNTS_RAW = os.environ.get("MEGA_ACCOUNTS", "").strip()
-
-          HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-          def send_progress(platform, stage, file_name="", mega_account=""):
-              if not PROGRESS_URL:
-                  return
-              try:
-                  payload = {
-                      "webhook_secret": WEBHOOK_SECRET,
-                      "post_id": POST_ID,
-                      "run_id": RUN_ID,
-                      "platform": platform,
-                      "stage": stage,
-                      "file_name": file_name,
-                      "mega_account": mega_account
-                  }
-                  requests.post(PROGRESS_URL, json=payload, headers=HEADERS, timeout=15)
-              except Exception as e:
-                  print(f"Progress ping warning: {e}")
-
-          def send_failure_and_exit(error_msg):
-              print(f"::error title=Job Failed::{error_msg}")
-              if CALLBACK_URL:
-                  try:
-                      payload = {
-                          "webhook_secret": WEBHOOK_SECRET,
-                          "post_id": POST_ID,
-                          "status": "failed",
-                          "error_message": error_msg
-                      }
-                      requests.post(CALLBACK_URL, json=payload, headers=HEADERS, timeout=20)
-                  except Exception as e:
-                      print(f"Failure callback error: {e}")
-              sys.exit(1)
 
           DOWNLOAD_DIR = os.path.abspath("downloads")
           os.makedirs(DOWNLOAD_DIR, exist_ok=True)
           os.chdir(DOWNLOAD_DIR)
 
-          # рзз. Google Drive ржерзЗржХрзЗ ржбрж╛ржЙржирж▓рзЛржб
-          send_progress("Google Drive", "тмЗя╕П ржЧрзБржЧрж▓ ржбрзНрж░рж╛ржЗржн ржерзЗржХрзЗ ржлрж╛ржЗрж▓ ржбрж╛ржЙржирж▓рзЛржб рж╣ржЪрзНржЫрзЗ...")
+          # ১. Google Drive থেকে ডাউনলোড এবং ফাইলের সাইজ মাপা
           try:
               url = f"https://drive.google.com/uc?id={GDRIVE_ID}"
               gdown.download(url, quiet=False)
               files = os.listdir(DOWNLOAD_DIR)
               if not files:
-                  send_failure_and_exit("ржЧрзБржЧрж▓ ржбрзНрж░рж╛ржЗржн ржерзЗржХрзЗ ржлрж╛ржЗрж▓ ржбрж╛ржЙржирж▓рзЛржб ржХрж░рж╛ ржпрж╛рзЯржирж┐ (Public ржкрж╛рж░ржорж┐рж╢ржи ржмрж╛ ржХрзЛржЯрж╛ ржЪрзЗржХ ржХрж░рзБржи)")
+                  print("::error title=Google Drive Error::ফাইল ডাউনলোড করা যায়নি!")
+                  sys.exit(1)
               file_path = os.path.join(DOWNLOAD_DIR, files[0])
           except Exception as e:
-              send_failure_and_exit(f"Google Drive ржбрж╛ржЙржирж▓рзЛржб рждрзНрж░рзБржЯрж┐: {e}")
+              print(f"::error title=Google Drive Exception::{e}")
+              sys.exit(1)
 
           file_name = os.path.basename(file_path)
           file_size = os.path.getsize(file_path)
           file_size_gb = round(file_size / (1024**3), 3)
-          file_size_mb = round(file_size / (1024**2), 2)
-          size_label = f"{file_size_gb} GB" if file_size_gb >= 1 else f"{file_size_mb} MB"
-          print(f"::notice title=Downloaded::{file_name} (Size: {size_label})")
+          print(f"::notice title=Downloaded::{file_name} (Size: {file_size_gb} GB)")
 
-          # рзи. Pixeldrain-ржП ржЖржкрж▓рзЛржб
+          # ২. Pixeldrain-এ আপলোড
           pixeldrain_url = ""
           if NEED_PD == "yes" and PIXELDRAIN_API:
-              send_progress("Pixeldrain", f"ЁЯЯг Pixeldrain-ржП ржЖржкрж▓рзЛржб рж╣ржЪрзНржЫрзЗ ({size_label})...", file_name=file_name)
               try:
                   encoded_name = urllib.parse.quote(file_name)
                   pd_api_url = f"https://pixeldrain.com/api/file/{encoded_name}"
@@ -131,7 +86,7 @@ jobs:
               except Exception as e:
                   print(f"::warning title=Pixeldrain Exception::{e}")
 
-          # рзй. MEGA-рждрзЗ рззрзп.рзо ржЬрж┐ржмрж┐ (19.8 GB) рж╕рзНржорж╛рж░рзНржЯ рж╕рзНржЯрзЛрж░рзЗржЬ ржЪрзЗржХрж┐ржВ ржУ рж░рзБржЯ ржЖржкрж▓рзЛржб
+          # ৩. MEGA-তে ১৯.৮ জিবি (19.8 GB) হার্ড লিমিট ও স্মার্ট স্টোরেজ চেকিং
           mega_url = ""
           used_mega_account = ""
           MAX_LIMIT_GB = 19.8
@@ -140,9 +95,11 @@ jobs:
           def get_mega_used_bytes():
               df_cmd = subprocess.run(["mega-df"], capture_output=True, text=True)
               out = df_cmd.stdout
+              # সরাসরি বাইট (Bytes) চেক করা
               m_bytes = re.search(r"USED STORAGE:\s+(\d+)", out, re.IGNORECASE)
               if m_bytes:
                   return int(m_bytes.group(1))
+              # পার্সেন্টেজ থাকলে তা থেকে বাইট বের করা
               m_pct = re.search(r"([\d.]+)%\s+of\s+([\d.]+)\s*GB", out, re.IGNORECASE)
               if m_pct:
                   pct = float(m_pct.group(1))
@@ -156,21 +113,21 @@ jobs:
                   email, password = acc.split(":", 1)
                   email = email.strip()
                   password = password.strip()
-                  send_progress("MEGA", f"ЁЯФ┤ MEGA ржПржХрж╛ржЙржирзНржЯ #{idx} ({email}) рж╕рзНржЯрзЛрж░рзЗржЬ ржЪрзЗржХ ржХрж░рж╛ рж╣ржЪрзНржЫрзЗ...", file_name=file_name, mega_account=email)
                   print(f"[{idx}/{len(accounts)}] Checking MEGA Account: {email}...")
 
                   try:
                       subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                       login = subprocess.run(["mega-login", email, password], capture_output=True, text=True)
                       if login.returncode != 0:
-                          print(f"::warning title=MEGA Login Failed::{email} рж▓ржЧржЗржи рж╣рзЯржирж┐, ржкрж░рзЗрж░ ржПржХрж╛ржЙржирзНржЯрзЗ ржпрж╛ржЪрзНржЫрзЗ...")
+                          print(f"::warning title=MEGA Login Failed::{email} লগইন হয়নি, পরের একাউন্টে যাচ্ছে...")
                           continue
 
-                      # ржЯрзНрж░рзНржпрж╛рж╢ (Rubbish Bin) ржЦрж╛рж▓рж┐ ржХрж░рж╛
+                      # ট্র্যাশ (Rubbish Bin) খালি করা যাতে ডিলিট করা ফাইল জায়গা দখল করে না রাখে
                       subprocess.run(["mega-rm", "-r", "-f", "//bin/*"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
                       used_bytes = get_mega_used_bytes()
                       if used_bytes is None:
+                          print(f"::warning title=Storage Check Failed::{email} এর স্টোরেজ পড়া যায়নি, নিরাপত্তার জন্য পরের একাউন্টে যাচ্ছে...")
                           subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                           continue
 
@@ -181,19 +138,19 @@ jobs:
 
                       print(f"Account: {email} | Used: {used_gb} GB | Free (up to 19.8 GB): {free_gb} GB | File Size: {file_size_gb} GB")
 
-                      # рззрзп.рзо ржЬрж┐ржмрж┐рж░ ржмрзЗрж╢рж┐ рж╣рзЯрзЗ ржЧрзЗрж▓рзЗ ржкрж░рзЗрж░ ржПржХрж╛ржЙржирзНржЯрзЗ ржпрж╛ржмрзЗ
+                      # যদি (বর্তমান ব্যবহৃত জায়গা + ফাইলের সাইজ) ১৯.৮ জিবির বেশি হয়, তবে স্কিপ করে পরের একাউন্টে যাবে
                       if (used_bytes + file_size) > MAX_LIMIT_BYTES:
-                          print(f"::notice title=Skipped ({email})::ржЬрж╛рзЯржЧрж╛ ржЦрж╛рж▓рж┐ ржЖржЫрзЗ {free_gb} GB, ржХрж┐ржирзНрждрзБ ржлрж╛ржЗрж▓ржЯрж┐ {file_size_gb} GB (рззрзп.рзо ржЬрж┐ржмрж┐ рж▓рж┐ржорж┐ржЯ ржЕрждрж┐ржХрзНрж░ржо ржХрж░ржмрзЗ)ред ржкрж░рзЗрж░ ржПржХрж╛ржЙржирзНржЯрзЗ ржпрж╛ржЪрзНржЫрзЗ...")
+                          print(f"::notice title=Skipped ({email})::জায়গা খালি আছে {free_gb} GB, কিন্তু ফাইলটি {file_size_gb} GB (আপলোড করলে {projected_gb} GB হয়ে যাবে, যা 19.8 GB-এর বেশি)। পরের একাউন্ট চেক হচ্ছে...")
                           subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                           continue
 
-                      # ржкрж░рзНржпрж╛ржкрзНржд ржЬрж╛рзЯржЧрж╛ ржкрж╛ржУрзЯрж╛ ржЧрзЗржЫрзЗ, рж╕рж░рж╛рж╕рж░рж┐ Root (/) ржП ржЖржкрж▓рзЛржб рж╣ржЪрзНржЫрзЗ
-                      send_progress("MEGA", f"ЁЯФ┤ MEGA-рждрзЗ ржЖржкрж▓рзЛржб рж╣ржЪрзНржЫрзЗ ({email} | {size_label})...", file_name=file_name, mega_account=email)
+                      # পর্যাপ্ত জায়গা পাওয়া গেছে, এখন সরাসরি Root (/) এ আপলোড হবে
+                      print(f"Sufficient space found in {email}! Uploading {file_name}...")
                       subprocess.run(["mega-rm", "-f", f"/{file_name}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                       put_cmd = subprocess.run(["mega-put", file_path, "/"], capture_output=True, text=True)
 
                       if put_cmd.returncode != 0:
-                          print(f"::warning title=MEGA Upload Error::{email} ржПржХрж╛ржЙржирзНржЯрзЗ ржЖржкрж▓рзЛржб рж╣рзЯржирж┐, ржкрж░рзЗрж░ ржПржХрж╛ржЙржирзНржЯрзЗ ржЪрзЗрж╖рзНржЯрж╛ ржХрж░рж╛ рж╣ржЪрзНржЫрзЗ...")
+                          print(f"::warning title=MEGA Upload Error::{email} একাউন্টে আপলোড সম্পন্ন হয়নি, পরের একাউন্টে চেষ্টা করা হচ্ছে...")
                           subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                           continue
 
@@ -202,7 +159,7 @@ jobs:
                       if match:
                           mega_url = match.group(1)
                           used_mega_account = email
-                          print(f"::notice title=MEGA Upload Success::{email} ржПржХрж╛ржЙржирзНржЯрзЗ ржЖржкрж▓рзЛржб рж╕ржорзНржкржирзНржи ({projected_gb} / 19.8 GB used)")
+                          print(f"::notice title=MEGA Upload Success::{email} একাউন্টে আপলোড সম্পন্ন ({projected_gb} / 19.8 GB used)")
                           subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                           break
                   except Exception as e:
@@ -210,23 +167,19 @@ jobs:
                       subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                       continue
 
-          if (NEED_PD == "yes" and not pixeldrain_url) and (NEED_MEGA == "yes" and not mega_url):
-              send_failure_and_exit("Pixeldrain ржПржмржВ MEGA ржХрзЛржирзЛржЯрж┐рждрзЗржЗ ржлрж╛ржЗрж▓ ржЖржкрж▓рзЛржб рж╕ржлрж▓ рж╣рзЯржирж┐ (API ржмрж╛ рж╕рзНржЯрзЛрж░рзЗржЬ ржЪрзЗржХ ржХрж░рзБржи)")
-
-          # рзк. WordPress-ржП рж▓рж┐ржВржХ ржлрзЗрж░ржд ржкрж╛ржарж╛ржирзЛ (рж╕рж╛ржерзЗ рж╕рж╛ржерзЗ ржкрж░ржмрж░рзНрждрзА Queue ржлрж╛ржЗрж▓ ржЪрж╛рж▓рзБ рж╣ржмрзЗ)
-          send_progress("WordPress", "тЬЕ ржЖржкрж▓рзЛржб рж╕ржорзНржкржирзНржи! ржУрзЯрж╛рж░рзНржбржкрзНрж░рзЗрж╕рзЗ рж▓рж┐ржВржХ рж╕рзЗржн ржХрж░рзЗ ржкрж░рзЗрж░ ржлрж╛ржЗрж▓ ржЪрж╛рж▓рзБ ржХрж░рж╛ рж╣ржЪрзНржЫрзЗ...", file_name=file_name, mega_account=used_mega_account)
+          # ৪. WordPress-এ লিংক ফেরত পাঠানো
           try:
               payload = {
                   "webhook_secret": WEBHOOK_SECRET,
                   "post_id": POST_ID,
-                  "status": "completed",
                   "file_name": file_name,
                   "pixeldrain_url": pixeldrain_url,
                   "mega_url": mega_url,
                   "mega_account": used_mega_account
               }
-              cb = requests.post(CALLBACK_URL, json=payload, headers=HEADERS, timeout=30)
-              print(f"::notice title=WordPress Updated & Next Queued Triggered::Status {cb.status_code} - {cb.text}")
+              headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+              cb = requests.post(CALLBACK_URL, json=payload, headers=headers, timeout=30)
+              print(f"::notice title=WordPress Updated::Status {cb.status_code} - {cb.text}")
           except Exception as e:
               print(f"::error title=WordPress Callback Failed::{e}")
               sys.exit(1)
