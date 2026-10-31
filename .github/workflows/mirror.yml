@@ -1,5 +1,6 @@
 # CLOBD workflow v9.7.10: REST endpoint compatibility + MEGA live transfer monitor.
 name: Auto Mirror Google Drive to CLOBD Backups
+# CLOBD Queue Compatibility v9.7.11 - post_id fallback + REST error-body diagnostics
 
 run-name: >-
   CLOBD Queue ${{ github.event.client_payload.queue_id || 'legacy' }} - Post #${{ github.event.client_payload.post_id || 'unknown' }}
@@ -386,13 +387,41 @@ jobs:
                   raise RuntimeError("WordPress cloud-index lookup URL is missing.")
               response = requests.post(
                   INDEX_LOOKUP_URL,
-                  json={"webhook_secret": WEBHOOK_SECRET, "queue_id": QUEUE_ID, "file_name": file_name},
+                  json={
+                      "webhook_secret": WEBHOOK_SECRET,
+                      "queue_id": QUEUE_ID,
+                      "post_id": POST_ID,
+                      "file_name": file_name,
+                  },
                   headers={"User-Agent": "CLOBD-GitHub-Actions-Mirror"}, timeout=45
               )
-              response.raise_for_status()
-              data = response.json()
+              if not response.ok:
+                  # Include the REST response body: WP may return 404 because
+                  # the queue row disappeared, or because the route is absent.
+                  # These cases require different fixes and must not be hidden.
+                  detail = (response.text or "").strip().replace("\n", " ")[:1200]
+                  raise RuntimeError(
+                      f"WordPress cloud-index lookup failed (HTTP {response.status_code}) "
+                      f"at {INDEX_LOOKUP_URL}. Response: {detail}"
+                  )
+              try:
+                  data = response.json()
+              except ValueError as error:
+                  raise RuntimeError(
+                      "WordPress cloud-index lookup returned non-JSON data: " +
+                      (response.text or "")[:800]
+                  ) from error
               if not data.get("success"):
-                  raise RuntimeError("WordPress could not return the cloud index lookup result.")
+                  raise RuntimeError(
+                      "WordPress cloud-index lookup did not succeed: " +
+                      str(data.get("error") or data)[:800]
+                  )
+              if not data.get("queue_found", True):
+                  print(
+                      "::warning:: Queue row was not found by queue_id; "
+                      "using the requested File post ID fallback (" + str(data.get("post_id", POST_ID)) + ").",
+                      flush=True
+                  )
               return data
 
           def report_indexed_mega(entry, file_name):
