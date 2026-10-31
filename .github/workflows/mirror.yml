@@ -7,19 +7,19 @@ on:
   repository_dispatch:
     types: [mirror_gdrive_file, sync_cloud_index]
 
-# WordPress dispatches only one queue item at a time. This is a second safety
-# layer so two accidental/manual GitHub dispatches cannot upload concurrently.
-concurrency:
-  group: clobd-cloud-mirror-${{ github.repository }}
-  cancel-in-progress: false
-  queue: max
-
+# WordPress is the primary FIFO queue controller. GitHub provides a separate
+# concurrency group for mirror uploads and inventory sync so an index refresh
+# cannot hold or interfere with the upload runner.
 permissions:
   contents: read
 
 jobs:
   mirror_file:
     if: github.event.action == 'mirror_gdrive_file'
+    concurrency:
+      group: clobd-mirror-queue-${{ github.repository }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
@@ -558,27 +558,19 @@ jobs:
               if not NEED_PD and not NEED_MEGA:
                   raise RuntimeError("No upload destination was selected for this queue job.")
 
-              send_status("Resolving exact Google Drive filename", "Google Drive", "Reading source filename metadata without downloading the 1.29 GB file.")
-              drive_url = f"https://drive.google.com/uc?id={GDRIVE_ID}"
-              metadata = subprocess.run(
-                  [sys.executable, "-m", "gdown", drive_url, "--json", "--quiet"],
-                  capture_output=True, text=True, timeout=180,
-              )
-              if metadata.returncode != 0:
-                  raise RuntimeError("Could not resolve the Google Drive filename: " + (metadata.stderr or metadata.stdout)[:900])
-              try:
-                  metadata_files = json.loads(metadata.stdout)
-              except ValueError as error:
-                  raise RuntimeError("gdown returned invalid filename metadata: " + metadata.stdout[:500]) from error
-              if not isinstance(metadata_files, list) or not metadata_files or not isinstance(metadata_files[0], dict):
-                  raise RuntimeError("Google Drive did not return a downloadable file entry.")
-              file_name = os.path.basename(str(metadata_files[0].get("path") or "")).strip()
-              if not file_name:
-                  raise RuntimeError("Google Drive did not provide the exact source filename.")
-              print("::notice title=Source Filename::" + file_name)
+              send_status("Resolving exact filename from WordPress Queue", "WordPress", "Using the filename already stored for this post (preferring a previously confirmed remote filename). No separate Google Drive metadata subprocess is started.")
+              # The queue lookup endpoint returns the exact stored filename. For
+              # posts where a cloud upload has already succeeded, WordPress prefers
+              # the filename confirmed by that platform over the editable post title.
+              # This removes the slow gdown --json subprocess that was being cancelled
+              # before the actual upload stage on some GitHub-hosted runners.
+              inventory = lookup_cloud_index("")
+              file_name = os.path.basename(str(inventory.get("file_name") or "")).strip()
+              if not file_name or file_name in (".", "..") or file_name.lower().startswith("cloud file -"):
+                  raise RuntimeError("WordPress Queue has no usable exact source filename. Set the File post title to the original full filename, including extension, then retry.")
+              print("::notice title=Source Filename::" + file_name, flush=True)
 
-              send_status("Checking WordPress Cloud File Index", "Cloud File Index", "Looking up this exact case-sensitive filename in the stored PixelDrain and MEGA inventories.")
-              inventory = lookup_cloud_index(file_name)
+              send_status("Checking WordPress Cloud File Index", "Cloud File Index", "Looking up the exact case-sensitive filename " + file_name + " in the stored PixelDrain and MEGA inventories.")
               pd_candidates = inventory.get("pixeldrain") or []
               mega_candidates = inventory.get("mega") or []
               pd_will_upload = False
@@ -659,6 +651,7 @@ jobs:
                   print("::notice title=Source Download Skipped::All selected backup platforms already contain this exact filename.")
               else:
                   send_status("Downloading source from Google Drive", "Google Drive", "Downloading only because at least one selected platform has no exact indexed match.")
+                  drive_url = f"https://drive.google.com/uc?id={GDRIVE_ID}"
                   safe_name = os.path.basename(file_name)
                   output_path = os.path.join(DOWNLOAD_DIR, safe_name)
                   last_percent = [-1]
@@ -802,6 +795,10 @@ jobs:
 
   cloud_index_sync:
     if: github.event.action == 'sync_cloud_index'
+    concurrency:
+      group: clobd-cloud-index-sync-${{ github.repository }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     steps:
