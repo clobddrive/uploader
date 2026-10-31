@@ -1,6 +1,6 @@
-# CLOBD workflow v9.7.10: REST endpoint compatibility + MEGA live transfer monitor.
+# CLOBD workflow v9.7.12: MEGA transfer-row and exact remote-size confirmation fix.
 name: Auto Mirror Google Drive to CLOBD Backups
-# CLOBD Queue Compatibility v9.7.11 - post_id fallback + REST error-body diagnostics
+# CLOBD Queue v9.7.12 - supports MEGAcmd U/⇑ upload rows and robust exact-size confirmation.
 
 run-name: >-
   CLOBD Queue ${{ github.event.client_payload.queue_id || 'legacy' }} - Post #${{ github.event.client_payload.post_id || 'unknown' }}
@@ -507,7 +507,7 @@ jobs:
               """Read active and completed MEGA uploads, retaining long destination paths."""
               try:
                   result = subprocess.run(
-                      ["mega-transfers", "--only-uploads", "--show-completed", "--path-display-size=500"],
+                      ["mega-transfers", "--only-uploads", "--show-completed", "--limit=10000", "--path-display-size=1000"],
                       capture_output=True, text=True, timeout=45
                   )
                   combined = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
@@ -520,39 +520,70 @@ jobs:
               return _mega_size_to_bytes(value, unit)
 
           def get_exact_mega_remote_size(remote_path, file_name):
-              """Return the exact remote file size in bytes, or None if not yet visible."""
-              try:
-                  result = subprocess.run(
-                      ["mega-ls", "-l", "--time-format=ISO6081", remote_path],
-                      capture_output=True, text=True, timeout=60
-                  )
-              except Exception:
-                  return None
-              if result.returncode != 0:
-                  return None
-              output = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", result.stdout or "")
-              for raw_line in output.splitlines():
-                  line = raw_line.strip()
-                  if not line.endswith(file_name):
+              """Read an exact byte size from MEGAcmd's documented FLAGS/VERS/SIZE/DATE/NAME listing.
+
+              Check the direct path first, then the account root. The second query is a
+              compatibility fallback for MEGAcmd builds that do not return a file when
+              its full remote path is passed as a listing filter.
+              """
+              commands = [
+                  ["mega-ls", "-l", "--time-format=ISO6081", remote_path],
+                  ["mega-ls", "-l", "--time-format=ISO6081", "/"],
+              ]
+              seen_outputs = []
+              for command in commands:
+                  try:
+                      result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+                  except Exception as error:
+                      seen_outputs.append(str(error))
                       continue
-                  # MEGA's `ls -l` summary columns are FLAGS, VERS, SIZE, DATE, NAME.
-                  columns = line.split(maxsplit=4)
-                  if len(columns) >= 5 and columns[4].strip().strip('"') == file_name:
-                      size_text = columns[2].replace(",", "")
-                      if size_text.isdigit():
-                          return int(size_text)
+                  output = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", (result.stdout or "") + "\n" + (result.stderr or ""))
+                  seen_outputs.append(output[-1200:])
+                  if result.returncode != 0:
+                      continue
+                  for raw_line in output.splitlines():
+                      line = raw_line.strip().strip('"')
+                      # The -l format is FLAGS VERS SIZE DATE NAME. ISO6081 keeps
+                      # DATE as one token; tolerate a time token in other versions.
+                      match = re.match(
+                          r"^\s*\S+\s+\d+\s+([\d,]+)\s+\d{4}-\d{2}-\d{2}(?:T\S+)?\s+(.+?)\s*$",
+                          line
+                      )
+                      if match:
+                          listed_name = match.group(2).strip().strip('"')
+                          if listed_name == file_name or os.path.basename(listed_name.rstrip("/")) == file_name:
+                              size_text = match.group(1).replace(",", "")
+                              if size_text.isdigit():
+                                  return int(size_text)
+
+                      # Fallback parser for builds that add an extra date/time field,
+                      # quote names, or include a full remote path in NAME.
+                      if line.endswith(file_name):
+                          prefix = line[:-len(file_name)].strip()
+                          fields = prefix.split()
+                          # FLAGS, VERS, SIZE, DATE[ TIME ...]
+                          if len(fields) >= 4:
+                              for candidate in (fields[2], fields[-3] if len(fields) >= 5 else ""):
+                                  size_text = candidate.replace(",", "")
+                                  if size_text.isdigit():
+                                      return int(size_text)
+              print("MEGA exact-size lookup did not parse a matching ls -l row. Diagnostics:", " | ".join(seen_outputs)[-1800:], flush=True)
               return None
 
           def _mega_find_transfer_row(snapshot, file_name):
-              """Find the upload row for this exact filename and return row/tag/state/progress."""
-              expected = "/" + file_name
-              for line in (snapshot or "").splitlines():
-                  # A MEGA transfer row starts with U (upload), then its numeric TAG.
-                  if not re.search(r"^\s*U\s+\d+\s+", line):
+              """Find the upload row for this exact filename and return row/tag/state/progress.
+
+              MEGAcmd versions have displayed upload direction as either ASCII 'U' or
+              the Unicode upload arrow '⇑'. Accept both, and match the local source path
+              because the transfer table does not always show the remote destination.
+              """
+              for raw_line in (snapshot or "").splitlines():
+                  line = raw_line.strip()
+                  tag_match = re.match(r"^(?:U|⇑|↑|⬆|UPLOAD)\s+(\d+)\s+", line, re.IGNORECASE)
+                  if not tag_match:
                       continue
-                  if expected not in line and not line.rstrip().endswith(file_name):
+                  if file_name not in line:
                       continue
-                  tag_match = re.search(r"^\s*U\s+(\d+)\s+", line)
                   progress_match = re.search(
                       r"([\d.]+)%\s+of\s+([\d,.]+)\s*(B|BYTES?|KB|KIB|MB|MIB|GB|GIB|TB|TIB)\b",
                       line, re.IGNORECASE
@@ -569,8 +600,8 @@ jobs:
                       total = _mega_transfer_size_to_bytes(progress_match.group(2), progress_match.group(3))
                       completed = int(total * percent / 100.0)
                   return {
-                      "line": line.strip(),
-                      "tag": tag_match.group(1) if tag_match else "",
+                      "line": line,
+                      "tag": tag_match.group(1),
                       "state": state_match.group(1).upper() if state_match else "UNKNOWN",
                       "percent": percent,
                       "total": total,
@@ -637,6 +668,7 @@ jobs:
               active_complete_confirmations = 0
               transfer_tag = ""
               last_snapshot = ""
+              raw_transfer_snapshot_logged = False
               max_seconds = 7200
               stalled_seconds = 1200
 
@@ -657,6 +689,9 @@ jobs:
                       snapshot = get_mega_transfer_snapshot(file_name)
                       last_snapshot = snapshot or last_snapshot
                       transfer = _mega_find_transfer_row(snapshot, file_name)
+                      if not transfer and snapshot and not raw_transfer_snapshot_logged:
+                          print("MEGA transfer table did not match the target filename. Raw MEGAcmd output for diagnostics:\n" + snapshot[-2500:], flush=True)
+                          raw_transfer_snapshot_logged = True
                       if transfer and transfer.get("tag"):
                           transfer_tag = transfer["tag"]
 
@@ -691,7 +726,15 @@ jobs:
                               if remote_size == file_size:
                                   print("MEGA transfer is complete and exact remote file size is verified.", flush=True)
                                   return snapshot[-1800:]
-                              # The transfer list can update just before the node listing cache.
+                              if remote_size is None:
+                                  # A matching MEGAcmd transfer row marked COMPLETED is
+                                  # authoritative. Some CLI builds lag or format ls -l
+                                  # differently; final mega-export below independently
+                                  # verifies that the exact remote node exists.
+                                  print("MEGA reports this exact upload as COMPLETED; remote size listing is unavailable. Proceeding to exact-path link export verification.", flush=True)
+                                  return snapshot[-1800:]
+                              # If a size is available but differs, do not accept a partial
+                              # or wrong object. Allow the remote listing cache a short time.
                               if now - last_remote_size_check > 5:
                                   last_remote_size_check = now
                                   time.sleep(3)
@@ -764,10 +807,25 @@ jobs:
                               )
                               print("::notice title=MEGA Transfer Monitor::Waiting for transfer row or exact remote file confirmation.", flush=True)
                               last_heartbeat = now
-                          if now - started > 300 and remote_size_confirmations == 0:
+                          if now - started > 180 and remote_size_confirmations == 0:
+                              # If the transfer row has already disappeared, test the
+                              # exact target by exporting it. Successful export proves
+                              # the completed object exists at that exact path; the
+                              # normal success path exports the same target again and
+                              # persists the resulting link to WordPress.
+                              export_probe = subprocess.run(
+                                  ["mega-export", "-a", remote_path],
+                                  capture_output=True, text=True, timeout=90
+                              )
+                              probe_text = (export_probe.stdout or "") + "\n" + (export_probe.stderr or "")
+                              if export_probe.returncode == 0 and re.search(r"https://mega\.nz/\S+", probe_text):
+                                  final_size = get_exact_mega_remote_size(remote_path, file_name)
+                                  if final_size == file_size:
+                                      print("MEGA transfer row is no longer listed; exact-path export and exact remote byte size are verified.", flush=True)
+                                      return probe_text[-1200:]
                               raise RemoteUploadStateUnknown(
-                                  "MEGA accepted the queued upload command, but no matching transfer row or exact remote file could be verified after five minutes. "
-                                  "No other account was attempted; refresh Cloud File Index before retrying."
+                                  "MEGA accepted the queued upload command, but no matching transfer row and exact remote byte size could be verified after three minutes. "
+                                  "No other account was attempted; refresh Cloud File Index before retrying. " + probe_text[-500:]
                               )
 
                       # Check WordPress cancellation even when a transfer row is not available.
@@ -884,6 +942,23 @@ jobs:
                           print("::warning::", last_error)
                           continue
                       logged_in = True
+
+                      # Rescue a previous attempt that completed the remote upload but
+                      # failed before persisting its WordPress result. This is a direct
+                      # exact-path lookup in the currently selected account (not a full
+                      # account scan), and prevents re-uploading the same 2+ GB file.
+                      existing_remote_path = "/" + file_name
+                      existing_remote_size = get_exact_mega_remote_size(existing_remote_path, file_name)
+                      if existing_remote_size == file_size:
+                          existing_link = export_mega_link(existing_remote_path)
+                          print(f"::notice title=MEGA Existing Upload Reused::{email} already contains {file_name} with the exact {file_size}-byte size. No second upload will be started.", flush=True)
+                          send_status("MEGA existing upload reused", "mega", f"Account: {email} | File: {file_name} | Existing remote file size exactly matches {file_size} bytes; reusing its link without uploading again.")
+                          return existing_link, email, True, existing_remote_path
+                      if existing_remote_size is not None and existing_remote_size != file_size:
+                          raise RemoteUploadStateUnknown(
+                              f"An exact-name file already exists in {email}, but its remote size ({existing_remote_size} bytes) "
+                              f"does not match the source ({file_size} bytes). Upload blocked to avoid overwriting or duplicating it."
+                          )
 
                       used_bytes = get_mega_used_bytes()
                       projected_bytes = used_bytes + file_size
