@@ -98,7 +98,6 @@ jobs:
           GDRIVE_ID: ${{ github.event.client_payload.gdrive_id }}
           NEED_PD: ${{ github.event.client_payload.need_pd }}
           NEED_MEGA: ${{ github.event.client_payload.need_mega }}
-          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
           STATUS_URL: ${{ github.event.client_payload.status_url }}
           PLATFORM_RESULT_URL: ${{ github.event.client_payload.platform_result_url }}
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
@@ -120,8 +119,10 @@ jobs:
           GDRIVE_ID = os.environ.get("GDRIVE_ID", "").strip()
           NEED_PD = os.environ.get("NEED_PD", "no").strip().lower() == "yes"
           NEED_MEGA = os.environ.get("NEED_MEGA", "no").strip().lower() == "yes"
-          CALLBACK_URL = os.environ.get("CALLBACK_URL", "").strip()
           STATUS_URL = os.environ.get("STATUS_URL", "").strip()
+          # Derive the final callback endpoint from status_url. This keeps the
+          # repository_dispatch client_payload at 10 properties or fewer.
+          CALLBACK_URL = (STATUS_URL.rsplit("/", 1)[0] + "/update-links") if STATUS_URL else ""
           PLATFORM_RESULT_URL = os.environ.get("PLATFORM_RESULT_URL", "").strip()
           WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
           PIXELDRAIN_API = os.environ.get("PIXELDRAIN_API", "").strip()
