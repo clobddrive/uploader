@@ -1,6 +1,6 @@
-# CLOBD workflow v9.7.12: MEGA transfer-row and exact remote-size confirmation fix.
+# CLOBD workflow v9.7.13: blocking MEGA process, heartbeat watchdog and automatic index-gated queue.
 name: Auto Mirror Google Drive to CLOBD Backups
-# CLOBD Queue v9.7.12 - supports MEGAcmd U/⇑ upload rows and robust exact-size confirmation.
+# CLOBD Queue v9.7.13 - MEGA uploads are tied to the runner process and cannot detach silently.
 
 run-name: >-
   CLOBD Queue ${{ github.event.client_payload.queue_id || 'legacy' }} - Post #${{ github.event.client_payload.post_id || 'unknown' }}
@@ -23,7 +23,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     runs-on: ubuntu-22.04
-    timeout-minutes: 360
+    timeout-minutes: 180
 
     steps:
       - name: Checkout Repository
@@ -632,30 +632,29 @@ jobs:
                   return False
 
           def run_mega_put_with_heartbeat(file_path, file_name, account_email, file_size):
-              """Queue MEGA upload asynchronously and monitor the MEGA transfer until verified complete."""
+              """Run MEGA upload in the foreground; monitor the child and remote object until completion."""
               remote_path = "/" + file_name
-              command = ["mega-put", "-q", "--print-tag-at-start", file_path, "/"]
+              command = ["mega-put", "--print-tag-at-start", file_path, "/"]
               print("::notice title=MEGA Upload Started::Account " + account_email + " | " + file_name, flush=True)
-              print("MEGA command: mega-put -q --print-tag-at-start <local-file> /", flush=True)
+              print("MEGA command: mega-put --print-tag-at-start <local-file> / (foreground; no detached queue mode)", flush=True)
+              send_status("MEGA upload starting", "mega", f"Account: {account_email} | File: {file_name} | Starting foreground MEGA transfer.")
 
-              # -q is MEGAcmd's documented background-transfer mode. It returns after
-              # queueing the transfer; mega-transfers is then the source of truth.
-              start_result = subprocess.run(command, capture_output=True, text=True, timeout=90)
-              start_output = (start_result.stdout or "") + ("\n" + start_result.stderr if start_result.stderr else "")
-              if start_output.strip():
-                  print("MEGA transfer queued:", start_output.strip()[-1200:], flush=True)
-              if start_result.returncode != 0:
-                  # A command response can be lost after MEGA accepted the request.
-                  # Check the exact target before treating this as a definite failure.
+              command_log = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
+              try:
+                  process = subprocess.Popen(
+                      command,
+                      stdout=command_log,
+                      stderr=subprocess.STDOUT,
+                  )
+              except Exception as error:
+                  command_log.close()
                   remote_size = get_exact_mega_remote_size(remote_path, file_name)
                   if remote_size == file_size:
-                      print("MEGA already contains the exact completed file after the queue command returned an error.", flush=True)
-                      return start_output[-1200:]
-                  raise RuntimeError(
-                      "mega-put could not queue the upload (exit " + str(start_result.returncode) + "): " +
-                      (start_output[-1200:] or "No output returned.")
-                  )
+                      print("MEGA already contains the exact complete file although the local command could not start.", flush=True)
+                      return "Exact remote file already present."
+                  raise RuntimeError("Could not start foreground mega-put: " + str(error)) from error
 
+              transfer_tag = ""
               started = time.time()
               last_heartbeat = 0
               last_progress_time = started
@@ -663,180 +662,180 @@ jobs:
               previous_sample_bytes = None
               previous_sample_time = None
               speed_bps = None
-              last_remote_size_check = 0
-              remote_size_confirmations = 0
-              active_complete_confirmations = 0
-              transfer_tag = ""
               last_snapshot = ""
-              raw_transfer_snapshot_logged = False
+              last_snapshot_time = 0
+              progress_text = "MEGA command is active; waiting for transfer telemetry."
               max_seconds = 7200
               stalled_seconds = 1200
 
+              def _output_text():
+                  try:
+                      command_log.flush()
+                      command_log.seek(0)
+                      content = command_log.read()
+                      command_log.seek(0, 2)
+                      return content or ""
+                  except Exception:
+                      return ""
+
+              def _terminate_local_and_remote():
+                  try:
+                      if process.poll() is None:
+                          process.terminate()
+                          try:
+                              process.wait(timeout=15)
+                          except subprocess.TimeoutExpired:
+                              process.kill()
+                              process.wait(timeout=15)
+                  except Exception as terminate_error:
+                      print("::warning::Could not stop mega-put child cleanly: " + str(terminate_error), flush=True)
+                  _cancel_mega_transfer(transfer_tag)
+
               try:
-                  while True:
+                  while process.poll() is None:
                       now = time.time()
                       if now - started > max_seconds:
-                          _cancel_mega_transfer(transfer_tag)
+                          _terminate_local_and_remote()
                           remote_size = get_exact_mega_remote_size(remote_path, file_name)
                           if remote_size == file_size:
-                              print("MEGA exact remote file size verified after the 120-minute monitor limit.", flush=True)
-                              return last_snapshot[-1800:]
+                              print("MEGA exact remote file size verified after the 120-minute hard limit.", flush=True)
+                              return _output_text()[-1800:]
                           raise RemoteUploadStateUnknown(
-                              "MEGA transfer exceeded the 120-minute monitor limit. The exact remote file could not be verified; "
-                              "no other account was attempted. Refresh Cloud File Index before retrying."
+                              "Foreground MEGA upload exceeded the 120-minute hard limit. The exact remote file could not be verified; "
+                              "no other account was attempted to avoid creating a duplicate."
                           )
 
-                      snapshot = get_mega_transfer_snapshot(file_name)
-                      last_snapshot = snapshot or last_snapshot
-                      transfer = _mega_find_transfer_row(snapshot, file_name)
-                      if not transfer and snapshot and not raw_transfer_snapshot_logged:
-                          print("MEGA transfer table did not match the target filename. Raw MEGAcmd output for diagnostics:\n" + snapshot[-2500:], flush=True)
-                          raw_transfer_snapshot_logged = True
-                      if transfer and transfer.get("tag"):
-                          transfer_tag = transfer["tag"]
+                      # Read the command log without a PIPE so a progress line without a
+                      # newline cannot fill a pipe buffer and freeze mega-put itself.
+                      command_output_live = _output_text()
+                      tag_match = re.search(r"(?:transfer\s*tag|tag|transfer\s*id)\s*[:=#]?\s*(\d+)", command_output_live, re.I)
+                      if tag_match:
+                          transfer_tag = tag_match.group(1)
 
-                      if transfer:
-                          state = transfer["state"]
-                          progress_bytes = transfer.get("completed")
-                          percent = transfer.get("percent")
-                          if progress_bytes is not None:
-                              if previous_sample_bytes is not None and previous_sample_time is not None:
-                                  byte_delta = progress_bytes - previous_sample_bytes
-                                  time_delta = max(1.0, now - previous_sample_time)
-                                  if byte_delta > 0:
-                                      speed_bps = byte_delta / time_delta
-                              previous_sample_bytes = progress_bytes
-                              previous_sample_time = now
-                              if progress_bytes > last_progress_bytes:
-                                  last_progress_bytes = progress_bytes
-                                  last_progress_time = now
+                      # Poll transfer telemetry for progress, but the foreground mega-put
+                      # process is the completion authority. A lost transfer row can no
+                      # longer make this function falsely declare the upload finished.
+                      if now - last_snapshot_time >= 10:
+                          last_snapshot_time = now
+                          try:
+                              snapshot = get_mega_transfer_snapshot(file_name)
+                          except Exception as snapshot_error:
+                              snapshot = ""
+                              print("::warning::MEGA transfer telemetry query failed: " + str(snapshot_error), flush=True)
+                          if snapshot:
+                              last_snapshot = snapshot
+                          transfer = _mega_find_transfer_row(snapshot, file_name)
+                          if transfer:
+                              if transfer.get("tag"):
+                                  transfer_tag = str(transfer["tag"])
+                              state = str(transfer.get("state") or "UNKNOWN").upper()
+                              progress_bytes = transfer.get("completed")
+                              percent = transfer.get("percent")
+                              if progress_bytes is not None:
+                                  if previous_sample_bytes is not None and previous_sample_time is not None:
+                                      delta = progress_bytes - previous_sample_bytes
+                                      elapsed = max(1.0, now - previous_sample_time)
+                                      if delta > 0:
+                                          speed_bps = delta / elapsed
+                                  previous_sample_bytes = progress_bytes
+                                  previous_sample_time = now
+                                  if progress_bytes > last_progress_bytes:
+                                      last_progress_bytes = progress_bytes
+                                      last_progress_time = now
+                              if percent is not None:
+                                  completed_bytes = int(progress_bytes or (file_size * percent / 100.0))
+                                  progress_text = f"{_format_mega_bytes(completed_bytes)} / {_format_mega_bytes(file_size)} ({percent:.2f}%) · {state}"
+                                  if speed_bps and speed_bps > 0:
+                                      remaining = max(0, file_size - completed_bytes) / speed_bps
+                                      eta = f"{int(remaining // 60)}m {int(remaining % 60)}s" if remaining < 3600 else f"{int(remaining // 3600)}h {int((remaining % 3600) // 60)}m"
+                                      progress_text += f" · {_format_mega_bytes(speed_bps)}/s · ETA {eta}"
+                              else:
+                                  progress_text = state + " · " + str(transfer.get("line") or "")[:300]
 
-                          if state in ("FAILED", "CANCELLED"):
-                              remote_size = get_exact_mega_remote_size(remote_path, file_name)
-                              if remote_size == file_size:
-                                  print("MEGA reports a stopped transfer, but the exact remote file size is complete; treating it as success.", flush=True)
-                                  return snapshot[-1800:]
-                              raise RemoteUploadStateUnknown(
-                                  "MEGA transfer entered " + state + " state: " + transfer["line"] +
-                                  ". The full remote file was not verified, so no other account was attempted."
-                              )
-
-                          if state in ("COMPLETED", "SUCCESS"):
-                              remote_size = get_exact_mega_remote_size(remote_path, file_name)
-                              if remote_size == file_size:
-                                  print("MEGA transfer is complete and exact remote file size is verified.", flush=True)
-                                  return snapshot[-1800:]
-                              if remote_size is None:
-                                  # A matching MEGAcmd transfer row marked COMPLETED is
-                                  # authoritative. Some CLI builds lag or format ls -l
-                                  # differently; final mega-export below independently
-                                  # verifies that the exact remote node exists.
-                                  print("MEGA reports this exact upload as COMPLETED; remote size listing is unavailable. Proceeding to exact-path link export verification.", flush=True)
-                                  return snapshot[-1800:]
-                              # If a size is available but differs, do not accept a partial
-                              # or wrong object. Allow the remote listing cache a short time.
-                              if now - last_remote_size_check > 5:
-                                  last_remote_size_check = now
-                                  time.sleep(3)
-
-                          if state == "ACTIVE" and percent is not None and percent >= 99.99:
-                              if now - last_remote_size_check >= 15:
-                                  last_remote_size_check = now
+                              if state in ("FAILED", "CANCELLED"):
                                   remote_size = get_exact_mega_remote_size(remote_path, file_name)
                                   if remote_size == file_size:
-                                      active_complete_confirmations += 1
-                                      if active_complete_confirmations >= 2:
-                                          print("MEGA reports 100% and the exact remote file size was verified twice.", flush=True)
-                                          return snapshot[-1800:]
-                                  else:
-                                      active_complete_confirmations = 0
+                                      print("MEGA transfer table reports stopped but exact remote object size is complete.", flush=True)
+                                      _terminate_local_and_remote()
+                                      return _output_text()[-1800:]
+                                  raise RemoteUploadStateUnknown(
+                                      "MEGA transfer entered " + state + " state and the exact remote file size is not complete. " +
+                                      str(transfer.get("line") or "")[:500]
+                                  )
 
-                          if percent is not None and transfer.get("total"):
-                              done = min(file_size, int(progress_bytes or 0))
-                              total = file_size or int(transfer["total"])
-                              progress_text = f"{_format_mega_bytes(done)} / {_format_mega_bytes(total)} ({percent:.2f}%) · {state}"
-                              if speed_bps and speed_bps > 0:
-                                  speed_text = _format_mega_bytes(speed_bps) + "/s"
-                                  remaining_seconds = max(0, total - done) / speed_bps
-                                  if remaining_seconds < 3600:
-                                      eta_text = f"{int(remaining_seconds // 60)}m {int(remaining_seconds % 60)}s"
-                                  else:
-                                      eta_text = f"{int(remaining_seconds // 3600)}h {int((remaining_seconds % 3600) // 60)}m"
-                                  progress_text += f" · {speed_text} · ETA {eta_text}"
-                          else:
-                              progress_text = state + " · " + transfer["line"][:350]
-
-                          if now - last_heartbeat >= 20:
-                              send_status(
-                                  "MEGA upload in progress",
-                                  "mega",
-                                  f"Account: {account_email} | File: {file_name} | {progress_text} | Transfer tag: {transfer_tag or 'detecting'}"
-                              )
-                              print("::notice title=MEGA Transfer Progress::" + account_email + " | " + progress_text, flush=True)
-                              last_heartbeat = now
-
-                          if state in ("ACTIVE", "QUEUED", "PAUSED", "UNKNOWN"):
                               if now - last_progress_time > stalled_seconds:
                                   remote_size = get_exact_mega_remote_size(remote_path, file_name)
-                                  if remote_size == file_size and percent is not None and percent >= 99.99:
-                                      print("MEGA transfer telemetry stopped at 100%, and exact remote file size is complete.", flush=True)
-                                      return snapshot[-1800:]
-                                  _cancel_mega_transfer(transfer_tag)
+                                  if remote_size == file_size:
+                                      print("MEGA telemetry stopped but the exact remote file size is complete.", flush=True)
+                                      _terminate_local_and_remote()
+                                      return _output_text()[-1800:]
+                                  _terminate_local_and_remote()
                                   raise RemoteUploadStateUnknown(
                                       f"MEGA transfer made no measurable progress for {stalled_seconds // 60} minutes. "
-                                      "The exact remote file size was not verified; the current account was not failed over to avoid duplicates."
+                                      "The exact remote file size was not verified; this account was not failed over to avoid duplicates."
                                   )
-                      else:
-                          # When the transfer row disappears, the upload may have completed.
-                          # Confirm the exact remote byte size twice before accepting success.
-                          if now - last_remote_size_check >= 10:
-                              last_remote_size_check = now
-                              remote_size = get_exact_mega_remote_size(remote_path, file_name)
-                              if remote_size == file_size:
-                                  remote_size_confirmations += 1
-                                  if remote_size_confirmations >= 2:
-                                      print("MEGA transfer row disappeared and the exact remote file size was confirmed twice.", flush=True)
-                                      return snapshot[-1800:]
-                              else:
-                                  remote_size_confirmations = 0
-                          if now - last_heartbeat >= 20:
-                              send_status(
-                                  "Waiting for MEGA transfer confirmation",
-                                  "mega",
-                                  f"Account: {account_email} | File: {file_name} | MEGA transfer row is not visible yet; verifying exact remote file size."
-                              )
-                              print("::notice title=MEGA Transfer Monitor::Waiting for transfer row or exact remote file confirmation.", flush=True)
-                              last_heartbeat = now
-                          if now - started > 180 and remote_size_confirmations == 0:
-                              # If the transfer row has already disappeared, test the
-                              # exact target by exporting it. Successful export proves
-                              # the completed object exists at that exact path; the
-                              # normal success path exports the same target again and
-                              # persists the resulting link to WordPress.
-                              export_probe = subprocess.run(
-                                  ["mega-export", "-a", remote_path],
-                                  capture_output=True, text=True, timeout=90
-                              )
-                              probe_text = (export_probe.stdout or "") + "\n" + (export_probe.stderr or "")
-                              if export_probe.returncode == 0 and re.search(r"https://mega\.nz/\S+", probe_text):
-                                  final_size = get_exact_mega_remote_size(remote_path, file_name)
-                                  if final_size == file_size:
-                                      print("MEGA transfer row is no longer listed; exact-path export and exact remote byte size are verified.", flush=True)
-                                      return probe_text[-1200:]
-                              raise RemoteUploadStateUnknown(
-                                  "MEGA accepted the queued upload command, but no matching transfer row and exact remote byte size could be verified after three minutes. "
-                                  "No other account was attempted; refresh Cloud File Index before retrying. " + probe_text[-500:]
-                              )
 
-                      # Check WordPress cancellation even when a transfer row is not available.
                       if now - last_heartbeat >= 20:
-                          send_status("MEGA upload in progress", "mega", f"Account: {account_email} | File: {file_name} | Waiting for MEGA transfer status.")
+                          send_status(
+                              "MEGA upload in progress",
+                              "mega",
+                              f"Account: {account_email} | File: {file_name} | {progress_text} | Transfer tag: {transfer_tag or 'not reported'} | Foreground process is still running."
+                          )
+                          print("::notice title=MEGA Transfer Progress::" + account_email + " | " + progress_text, flush=True)
                           last_heartbeat = now
-                      time.sleep(10)
+                      time.sleep(5)
 
+                  # The foreground command has exited. Its own exit status is required.
+                  command_output = _output_text()
+                  exit_code = int(process.returncode or 0)
+                  if exit_code != 0:
+                      remote_size = get_exact_mega_remote_size(remote_path, file_name)
+                      if remote_size == file_size:
+                          print("mega-put returned non-zero after the exact complete remote object was confirmed.", flush=True)
+                          return command_output[-1800:]
+                      raise RemoteUploadStateUnknown(
+                          "Foreground mega-put exited with code " + str(exit_code) + " and the exact remote file size was not confirmed. " +
+                          (command_output[-1000:] or "No command output.")
+                      )
+
+                  # A successful foreground exit means the transfer command completed.
+                  # Confirm the exact remote object; if mega-ls size output is unavailable,
+                  # an exact-path export is the independent existence check.
+                  remote_size = None
+                  for verify_attempt in range(1, 4):
+                      remote_size = get_exact_mega_remote_size(remote_path, file_name)
+                      if remote_size == file_size:
+                          print("MEGA foreground upload completed and exact remote byte size is verified.", flush=True)
+                          return command_output[-1800:]
+                      if remote_size is not None and remote_size != file_size:
+                          time.sleep(5)
+                      elif verify_attempt < 3:
+                          time.sleep(3)
+
+                  export_probe = subprocess.run(
+                      ["mega-export", "-a", remote_path],
+                      capture_output=True, text=True, timeout=90
+                  )
+                  probe_text = (export_probe.stdout or "") + "\n" + (export_probe.stderr or "")
+                  if export_probe.returncode == 0 and re.search(r"https://mega\.nz/\S+", probe_text):
+                      final_size = get_exact_mega_remote_size(remote_path, file_name)
+                      if final_size is None or final_size == file_size:
+                          print("MEGA foreground command exited successfully and the exact remote path exported successfully.", flush=True)
+                          return (command_output + "\n" + probe_text)[-1800:]
+                  raise RemoteUploadStateUnknown(
+                      "mega-put exited successfully, but the exact remote object could not be confirmed by byte size or export. " +
+                      probe_text[-800:]
+                  )
               except JobCancelled:
-                  _cancel_mega_transfer(transfer_tag)
+                  _terminate_local_and_remote()
                   raise
+              finally:
+                  if process.poll() is None:
+                      _terminate_local_and_remote()
+                  try:
+                      command_log.close()
+                  except Exception:
+                      pass
 
           def upload_to_pixeldrain(file_path, file_name):
               if not PIXELDRAIN_API:
