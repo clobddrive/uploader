@@ -24,10 +24,10 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -348,8 +348,13 @@ jobs:
               send_status("Downloading source from Google Drive", "Google Drive", "Downloading the source file.")
 
               drive_url = f"https://drive.google.com/uc?id={GDRIVE_ID}"
+              # Keep this call compatible with gdown releases that do not expose
+              # the optional `fuzzy` argument. The direct Drive URL already
+              # contains the file ID, so fuzzy URL parsing is unnecessary.
               downloaded_path = gdown.download(
-                  url=drive_url, output=None, quiet=False, fuzzy=True
+                  url=drive_url,
+                  output=None,
+                  quiet=False,
               )
               if not downloaded_path or not os.path.isfile(downloaded_path):
                   raise RuntimeError("Google Drive download failed or returned no file.")
