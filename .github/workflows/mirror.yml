@@ -1,4 +1,4 @@
-# CLOBD workflow v9.7.8: MEGA capacity parsing + live transfer heartbeat/output.
+# CLOBD workflow v9.7.10: REST endpoint compatibility + MEGA live transfer monitor.
 name: Auto Mirror Google Drive to CLOBD Backups
 
 run-name: >-
@@ -40,6 +40,9 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           STATUS_URL: ${{ github.event.client_payload.status_url }}
           PLATFORM_RESULT_URL: ${{ github.event.client_payload.platform_result_url }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          INDEX_URL: ${{ github.event.client_payload.index_url }}
+          INDEX_LOOKUP_URL: ${{ github.event.client_payload.index_lookup_url }}
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
         run: |
           python - <<'PY'
@@ -50,6 +53,38 @@ jobs:
 
           status_url = os.environ.get("STATUS_URL", "").strip()
           queue_id = os.environ.get("QUEUE_ID", "").strip()
+          if not status_url:
+              # Backward compatibility for dispatches that contain a different
+              # CLOBD REST endpoint but omit status_url.
+              from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
+              reference = (os.environ.get("PLATFORM_RESULT_URL", "").strip()
+                           or os.environ.get("CALLBACK_URL", "").strip()
+                           or os.environ.get("INDEX_LOOKUP_URL", "").strip())
+              if reference:
+                  parts = urlsplit(reference)
+                  query = parse_qs(parts.query, keep_blank_values=True)
+                  known = ("queue-status", "platform-result", "update-links",
+                           "cloud-index", "cloud-index-lookup")
+                  if "rest_route" in query:
+                      route = (query.get("rest_route") or [""])[0].rstrip("/")
+                      for suffix in known:
+                          marker = "/" + suffix
+                          if route.endswith(marker):
+                              route = route[:-len(marker)]
+                              break
+                      query["rest_route"] = [route.rstrip("/") + "/queue-status"]
+                      status_url = urlunsplit((parts.scheme, parts.netloc, parts.path,
+                                               urlencode(query, doseq=True), parts.fragment))
+                  else:
+                      path = parts.path.rstrip("/")
+                      for suffix in known:
+                          marker = "/" + suffix
+                          if path.endswith(marker):
+                              path = path[:-len(marker)]
+                              break
+                      status_url = urlunsplit((parts.scheme, parts.netloc,
+                                               path.rstrip("/") + "/queue-status",
+                                               parts.query, parts.fragment))
           if status_url and queue_id:
               payload = {
                   "webhook_secret": os.environ.get("WEBHOOK_SECRET", ""),
@@ -111,6 +146,9 @@ jobs:
           NEED_MEGA: ${{ github.event.client_payload.need_mega }}
           STATUS_URL: ${{ github.event.client_payload.status_url }}
           PLATFORM_RESULT_URL: ${{ github.event.client_payload.platform_result_url }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          INDEX_URL: ${{ github.event.client_payload.index_url }}
+          INDEX_LOOKUP_URL: ${{ github.event.client_payload.index_lookup_url }}
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
           PIXELDRAIN_API: ${{ github.event.client_payload.pixeldrain_api }}
           MEGA_ACCOUNTS: ${{ github.event.client_payload.mega_accounts }}
@@ -134,14 +172,54 @@ jobs:
           GDRIVE_ID = os.environ.get("GDRIVE_ID", "").strip()
           NEED_PD = os.environ.get("NEED_PD", "no").strip().lower() == "yes"
           NEED_MEGA = os.environ.get("NEED_MEGA", "no").strip().lower() == "yes"
-          STATUS_URL = os.environ.get("STATUS_URL", "").strip()
-          # Derive the final callback endpoint from status_url. This keeps the
-          # repository_dispatch client_payload at 10 properties or fewer.
-          CALLBACK_URL = (STATUS_URL.rsplit("/", 1)[0] + "/update-links") if STATUS_URL else ""
-          PLATFORM_RESULT_URL = os.environ.get("PLATFORM_RESULT_URL", "").strip()
-          INDEX_BASE_URL = STATUS_URL.rsplit("/", 1)[0] if STATUS_URL else ""
-          INDEX_URL = INDEX_BASE_URL + "/cloud-index" if INDEX_BASE_URL else ""
-          INDEX_LOOKUP_URL = INDEX_BASE_URL + "/cloud-index-lookup" if INDEX_BASE_URL else ""
+          # Resolve all CLOBD REST endpoints from any endpoint supplied by the
+          # dispatch. Older plugin builds sent only callback_url/status_url;
+          # newer builds may also send platform_result_url. Do not require a
+          # separate dispatch property for every endpoint (GitHub caps payloads).
+          from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
+
+          def clobd_endpoint_from(reference, target):
+              reference = (reference or "").strip()
+              if not reference:
+                  return ""
+              parts = urlsplit(reference)
+              query = parse_qs(parts.query, keep_blank_values=True)
+              known = ("queue-status", "platform-result", "update-links",
+                       "cloud-index", "cloud-index-lookup")
+              if "rest_route" in query:
+                  route = (query.get("rest_route") or [""])[0].rstrip("/")
+                  for suffix in known:
+                      marker = "/" + suffix
+                      if route.endswith(marker):
+                          route = route[:-len(marker)]
+                          break
+                  query["rest_route"] = [route.rstrip("/") + "/" + target]
+                  return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                                     urlencode(query, doseq=True), parts.fragment))
+              path = parts.path.rstrip("/")
+              for suffix in known:
+                  marker = "/" + suffix
+                  if path.endswith(marker):
+                      path = path[:-len(marker)]
+                      break
+              path = path.rstrip("/") + "/" + target
+              return urlunsplit((parts.scheme, parts.netloc, path,
+                                 parts.query, parts.fragment))
+
+          _status_input = os.environ.get("STATUS_URL", "").strip()
+          _platform_input = os.environ.get("PLATFORM_RESULT_URL", "").strip()
+          _callback_input = os.environ.get("CALLBACK_URL", "").strip()
+          _index_input = os.environ.get("INDEX_URL", "").strip()
+          _lookup_input = os.environ.get("INDEX_LOOKUP_URL", "").strip()
+          _endpoint_reference = next((value for value in (
+              _status_input, _platform_input, _callback_input,
+              _lookup_input, _index_input) if value), "")
+
+          STATUS_URL = _status_input or clobd_endpoint_from(_endpoint_reference, "queue-status")
+          CALLBACK_URL = _callback_input or clobd_endpoint_from(_endpoint_reference, "update-links")
+          PLATFORM_RESULT_URL = _platform_input or clobd_endpoint_from(_endpoint_reference, "platform-result")
+          INDEX_URL = _index_input or clobd_endpoint_from(_endpoint_reference, "cloud-index")
+          INDEX_LOOKUP_URL = _lookup_input or clobd_endpoint_from(_endpoint_reference, "cloud-index-lookup")
           INDEX_SYNC_ID = ""
           WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
           PIXELDRAIN_API = os.environ.get("PIXELDRAIN_API", "").strip()
@@ -854,8 +932,15 @@ jobs:
           try:
               if not POST_ID or not GDRIVE_ID:
                   raise RuntimeError("Post ID or Google Drive file ID is missing.")
-              if QUEUE_ID and (not PLATFORM_RESULT_URL or not INDEX_LOOKUP_URL):
-                  raise RuntimeError("WordPress platform-result or cloud-index lookup URL is missing.")
+              if QUEUE_ID and (not STATUS_URL or not PLATFORM_RESULT_URL or not INDEX_LOOKUP_URL):
+                  raise RuntimeError(
+                      "WordPress REST endpoint resolution failed: "
+                      f"status_url={'ok' if STATUS_URL else 'missing'}, "
+                      f"platform_result_url={'ok' if PLATFORM_RESULT_URL else 'missing'}, "
+                      f"cloud_index_lookup_url={'ok' if INDEX_LOOKUP_URL else 'missing'}. "
+                      "The repository_dispatch did not contain a usable WordPress REST endpoint; "
+                      "update the CLOBD plugin dispatch payload or provide status_url/callback_url."
+                  )
               if not NEED_PD and not NEED_MEGA:
                   raise RuntimeError("No upload destination was selected for this queue job.")
 
