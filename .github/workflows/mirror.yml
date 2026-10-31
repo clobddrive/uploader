@@ -1,4 +1,3 @@
-# CLOBD workflow v9.7.8: MEGA capacity parsing + live transfer heartbeat/output.
 name: Auto Mirror Google Drive to CLOBD Backups
 
 run-name: >-
@@ -6,23 +5,22 @@ run-name: >-
 
 on:
   repository_dispatch:
-    types: [mirror_gdrive_file, sync_cloud_index]
+    types: [mirror_gdrive_file]
 
-# WordPress is the primary FIFO queue controller. GitHub provides a separate
-# concurrency group for mirror uploads and inventory sync so an index refresh
-# cannot hold or interfere with the upload runner.
+# WordPress dispatches only one queue item at a time. This is a second safety
+# layer so two accidental/manual GitHub dispatches cannot upload concurrently.
+concurrency:
+  group: clobd-cloud-mirror-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
 permissions:
   contents: read
 
 jobs:
   mirror_file:
-    if: github.event.action == 'mirror_gdrive_file'
-    concurrency:
-      group: clobd-mirror-queue-${{ github.repository }}
-      cancel-in-progress: false
-      queue: max
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
 
     steps:
       - name: Checkout Repository
@@ -39,7 +37,6 @@ jobs:
           QUEUE_ID: ${{ github.event.client_payload.queue_id }}
           RUN_ID: ${{ github.run_id }}
           STATUS_URL: ${{ github.event.client_payload.status_url }}
-          PLATFORM_RESULT_URL: ${{ github.event.client_payload.platform_result_url }}
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
         run: |
           python - <<'PY'
@@ -85,19 +82,10 @@ jobs:
       - name: Install Python Dependencies and MEGAcmd
         if: steps.report_queue.outputs.cancelled != 'true'
         run: |
-          python3 -m pip install --upgrade pip "gdown==6.5.1" requests
-          wget -q "https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb"
+          python3 -m pip install --upgrade pip gdown requests
+          wget -q "https://mega.nz/linux/repo/xUbuntu_24.04/amd64/megacmd-xUbuntu_24.04_amd64.deb"
           sudo apt-get update
-          sudo apt-get install -y "./megacmd-xUbuntu_22.04_amd64.deb" || sudo apt-get install -f -y
-
-      - name: Record runner diagnostics
-        if: steps.report_queue.outputs.cancelled != 'true'
-        run: |
-          echo "Runner image: ubuntu-22.04"
-          echo "GitHub run: $GITHUB_RUN_ID / attempt $GITHUB_RUN_ATTEMPT"
-          date -u
-          cat /etc/os-release | head -n 8
-          df -h "$GITHUB_WORKSPACE"
+          sudo apt-get install -y "./megacmd-xUbuntu_24.04_amd64.deb" || sudo apt-get install -f -y
 
       - name: Download from Google Drive and Upload Selected Backups
         if: steps.report_queue.outputs.cancelled != 'true'
@@ -109,24 +97,19 @@ jobs:
           GDRIVE_ID: ${{ github.event.client_payload.gdrive_id }}
           NEED_PD: ${{ github.event.client_payload.need_pd }}
           NEED_MEGA: ${{ github.event.client_payload.need_mega }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
           STATUS_URL: ${{ github.event.client_payload.status_url }}
-          PLATFORM_RESULT_URL: ${{ github.event.client_payload.platform_result_url }}
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
           PIXELDRAIN_API: ${{ github.event.client_payload.pixeldrain_api }}
           MEGA_ACCOUNTS: ${{ github.event.client_payload.mega_accounts }}
-          PYTHONUNBUFFERED: "1"
         run: |
           import os
           import re
           import sys
-          import json
           import subprocess
           import urllib.parse
           import requests
           import gdown
-          import time
-          import threading
-          import tempfile
 
           QUEUE_ID = os.environ.get("QUEUE_ID", "").strip()
           RUN_ID = os.environ.get("RUN_ID", "").strip()
@@ -134,15 +117,8 @@ jobs:
           GDRIVE_ID = os.environ.get("GDRIVE_ID", "").strip()
           NEED_PD = os.environ.get("NEED_PD", "no").strip().lower() == "yes"
           NEED_MEGA = os.environ.get("NEED_MEGA", "no").strip().lower() == "yes"
+          CALLBACK_URL = os.environ.get("CALLBACK_URL", "").strip()
           STATUS_URL = os.environ.get("STATUS_URL", "").strip()
-          # Derive the final callback endpoint from status_url. This keeps the
-          # repository_dispatch client_payload at 10 properties or fewer.
-          CALLBACK_URL = (STATUS_URL.rsplit("/", 1)[0] + "/update-links") if STATUS_URL else ""
-          PLATFORM_RESULT_URL = os.environ.get("PLATFORM_RESULT_URL", "").strip()
-          INDEX_BASE_URL = STATUS_URL.rsplit("/", 1)[0] if STATUS_URL else ""
-          INDEX_URL = INDEX_BASE_URL + "/cloud-index" if INDEX_BASE_URL else ""
-          INDEX_LOOKUP_URL = INDEX_BASE_URL + "/cloud-index-lookup" if INDEX_BASE_URL else ""
-          INDEX_SYNC_ID = ""
           WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
           PIXELDRAIN_API = os.environ.get("PIXELDRAIN_API", "").strip()
           MEGA_ACCOUNTS_RAW = os.environ.get("MEGA_ACCOUNTS", "").strip()
@@ -153,14 +129,10 @@ jobs:
           class JobCancelled(Exception):
               pass
 
-          class RemoteUploadStateUnknown(RuntimeError):
-              """Stop failover when a remote upload may already have completed."""
-              pass
-
           def send_status(stage, platform="", message=""):
-              """Best-effort live telemetry; only an explicit WordPress cancel stops the worker."""
+              """Send live stage/platform information to the WordPress Queue page."""
               if not STATUS_URL or not QUEUE_ID:
-                  return False
+                  return
               payload = {
                   "webhook_secret": WEBHOOK_SECRET,
                   "queue_id": QUEUE_ID,
@@ -169,32 +141,18 @@ jobs:
                   "platform": platform,
                   "message": message,
               }
-              last_error = None
-              for status_attempt in range(1, 4):
-                  try:
-                      response = requests.post(STATUS_URL, json=payload, timeout=20)
-                      if response.status_code == 409:
-                          raise JobCancelled("This job was cancelled from the WordPress dashboard.")
-                      response.raise_for_status()
-                      try:
-                          if response.json().get("cancelled"):
-                              raise JobCancelled("This job was cancelled from the WordPress dashboard.")
-                      except ValueError:
-                          pass
-                      print(f"::notice title=CLOBD Stage::{stage} | {platform or 'system'} | {message}", flush=True)
-                      return True
-                  except JobCancelled:
-                      raise
-                  except Exception as status_error:
-                      last_error = status_error
-                      print(f"::warning::WordPress progress update {status_attempt}/3 failed: {status_error}", flush=True)
-                      if status_attempt < 3:
-                          time.sleep(status_attempt * 2)
-              print(f"::warning::Continuing transfer despite temporary WordPress telemetry failure: {last_error}", flush=True)
-              return False
+              response = requests.post(STATUS_URL, json=payload, timeout=25)
+              if response.status_code == 409:
+                  raise JobCancelled("This job was cancelled from the WordPress dashboard.")
+              response.raise_for_status()
+              try:
+                  if response.json().get("cancelled"):
+                      raise JobCancelled("This job was cancelled from the WordPress dashboard.")
+              except ValueError:
+                  pass
 
           def send_final_callback(file_name, pd_url, mega_url, mega_account,
-                                 pd_status, mega_status, message="", mega_remote_path=""):
+                                 pd_status, mega_status, message=""):
               if not CALLBACK_URL:
                   raise RuntimeError("WordPress callback URL is missing.")
               payload = {
@@ -205,7 +163,6 @@ jobs:
                   "pixeldrain_url": pd_url or "",
                   "mega_url": mega_url or "",
                   "mega_account": mega_account or "",
-                  "mega_remote_path": mega_remote_path or "",
                   "pd_status": pd_status,
                   "mega_status": mega_status,
                   "message": message,
@@ -219,287 +176,26 @@ jobs:
               response.raise_for_status()
               print("WordPress callback accepted:", response.status_code)
 
-          def report_platform_result(platform, url, account="", message="", remote_path=""):
-              """Persist each successful/reused remote link before proceeding."""
-              if not PLATFORM_RESULT_URL or not QUEUE_ID:
-                  return False, "Partial platform callback URL is not configured."
-
-              payload = {
-                  "webhook_secret": WEBHOOK_SECRET,
-                  "queue_id": QUEUE_ID,
-                  "post_id": POST_ID,
-                  "platform": platform,
-                  "url": url,
-                  "file_name": file_name,
-                  "account": account,
-                  "remote_path": remote_path,
-                  "message": message,
-              }
-              last_error = "Unknown WordPress callback error."
-              for attempt in range(1, 4):
-                  try:
-                      response = requests.post(
-                          PLATFORM_RESULT_URL,
-                          json=payload,
-                          headers={"User-Agent": "CLOBD-GitHub-Actions-Mirror"},
-                          timeout=45,
-                      )
-                      if response.status_code == 409:
-                          raise JobCancelled("The queue job was cancelled in WordPress.")
-                      response.raise_for_status()
-                      try:
-                          result = response.json()
-                      except ValueError:
-                          result = {}
-                      if result.get("cancelled"):
-                          raise JobCancelled("The queue job was cancelled in WordPress after saving the completed platform link.")
-                      print(f"WordPress saved {platform} result immediately (HTTP {response.status_code}).")
-                      return True, ""
-                  except JobCancelled:
-                      raise
-                  except Exception as error:
-                      last_error = str(error)
-                      print(f"::warning:: Partial {platform} callback attempt {attempt}/3 failed: {last_error}")
-                      if attempt < 3:
-                          time.sleep(attempt * 3)
-              return False, last_error
-
-          def verify_indexed_pixeldrain(entry, file_name):
-              """Verify one indexed PixelDrain ID; never list the whole account per upload."""
-              file_id = str(entry.get("remote_id") or "").strip()
-              if not file_id:
-                  parsed = re.search(r"pixeldrain\.com/(?:u|api/file)/([A-Za-z0-9_-]+)", str(entry.get("url") or ""))
-                  file_id = parsed.group(1) if parsed else ""
-              if not file_id:
-                  raise RuntimeError("The PixelDrain index entry has no usable file ID.")
-              info_response = requests.get(
-                  f"https://pixeldrain.com/api/file/{urllib.parse.quote(file_id, safe='')}/info",
-                  headers={"Accept": "application/json"}, timeout=(15, 60)
-              )
-              if info_response.status_code == 404:
-                  mark_index_stale("pixeldrain", "PixelDrain", file_name, file_id)
-                  return None
-              if info_response.status_code != 200:
-                  raise RuntimeError(
-                      f"Could not verify indexed PixelDrain file {file_id} (HTTP {info_response.status_code}). "
-                      "Upload stopped to avoid creating a duplicate while the index entry is uncertain."
-                  )
-              info = info_response.json()
-              if info.get("id") and info.get("name") == file_name:
-                  return "https://pixeldrain.com/u/" + file_id
-              if info.get("id"):
-                  # A changed or case-different name is not an exact filename match.
-                  mark_index_stale("pixeldrain", "PixelDrain", file_name, file_id)
-                  return None
-              raise RuntimeError("PixelDrain did not confirm the exact indexed filename.")
-
-          def mark_index_stale(platform, account, file_name, remote_path=""):
-              if not INDEX_URL:
-                  return
-              payload = {
-                  "webhook_secret": WEBHOOK_SECRET, "sync_id": INDEX_SYNC_ID,
-                  "action": "mark_stale", "platform": platform, "account": account,
-                  "file_name": file_name, "remote_path": remote_path
-              }
-              requests.post(INDEX_URL, json=payload, timeout=30).raise_for_status()
-
-          def lookup_cloud_index(file_name):
-              if not INDEX_LOOKUP_URL:
-                  raise RuntimeError("WordPress cloud-index lookup URL is missing.")
-              response = requests.post(
-                  INDEX_LOOKUP_URL,
-                  json={"webhook_secret": WEBHOOK_SECRET, "queue_id": QUEUE_ID, "file_name": file_name},
-                  headers={"User-Agent": "CLOBD-GitHub-Actions-Mirror"}, timeout=45
-              )
-              response.raise_for_status()
-              data = response.json()
-              if not data.get("success"):
-                  raise RuntimeError("WordPress could not return the cloud index lookup result.")
-              return data
-
-          def report_indexed_mega(entry, file_name):
-              """Export a link from only the indexed MEGA account/path; never rescan all accounts."""
-              target_account = str(entry.get("account") or "").strip()
-              remote_path = str(entry.get("remote_path") or "").strip()
-              if not target_account or not remote_path:
-                  raise RuntimeError("MEGA index entry is missing its account or exact remote path.")
-              matches = [line.strip() for line in MEGA_ACCOUNTS_RAW.splitlines() if ":" in line.strip() and line.split(":", 1)[0].strip().lower() == target_account.lower()]
-              if not matches:
-                  raise RuntimeError("The indexed MEGA account is no longer present in WordPress Settings: " + target_account)
-              email, password = matches[0].split(":", 1)
-              mega_logout()
-              try:
-                  login = subprocess.run(["mega-login", email.strip(), password.strip()], capture_output=True, text=True, timeout=180)
-                  if login.returncode != 0:
-                      raise RuntimeError("Could not log into indexed MEGA account " + target_account + ": " + (login.stderr or login.stdout)[:500])
-                  try:
-                      link = export_mega_link(remote_path)
-                  except Exception as error:
-                      # An indexed path that no longer exports is treated as uncertain, not absent.
-                      raise RemoteUploadStateUnknown(
-                          "MEGA index says the exact file exists in " + target_account + ", but its link could not be exported. "
-                          "No upload was started; refresh Cloud File Index before retrying. " + str(error)
-                      ) from error
-                  return link, target_account, remote_path
-              finally:
-                  mega_logout()
-
-          def _mega_size_to_bytes(number, unit):
-              value = float(str(number).replace(",", ""))
-              unit = (unit or "B").upper()
-              powers = {
-                  "B": 0, "BYTE": 0, "BYTES": 0,
-                  "KB": 1, "KIB": 1,
-                  "MB": 2, "MIB": 2,
-                  "GB": 3, "GIB": 3,
-                  "TB": 4, "TIB": 4,
-              }
-              if unit not in powers:
-                  raise ValueError("Unrecognized MEGA storage unit: " + unit)
-              return int(value * (1024 ** powers[unit]))
-
           def get_mega_used_bytes():
-              # -h gives decimal values with explicit units. Parse the full value;
-              # never let a regex read only the integer part of e.g. 18.75 GB.
               result = subprocess.run(
-                  ["mega-df", "-h"], capture_output=True, text=True, timeout=90
+                  ["mega-df"], capture_output=True, text=True, timeout=60
               )
               output = (result.stdout or "") + "\n" + (result.stderr or "")
-              if result.returncode != 0:
-                  raise RuntimeError("mega-df failed: " + output[-1200:])
 
-              used_match = re.search(
-                  r"USED STORAGE:\s*([\d,]+(?:\.\d+)?)\s*(B|BYTES?|KB|KIB|MB|MIB|GB|GIB|TB|TIB)?\b",
-                  output, re.IGNORECASE
+              # Some MEGAcmd versions report the used bytes directly.
+              match = re.search(r"USED STORAGE:\s*(\d+)", output, re.IGNORECASE)
+              if match:
+                  return int(match.group(1))
+
+              # Fallback for percentage/total output.
+              match = re.search(
+                  r"([\d.]+)%\s+of\s+([\d.]+)\s*GB", output, re.IGNORECASE
               )
-              if used_match:
-                  unit = used_match.group(2) or "B"
-                  return _mega_size_to_bytes(used_match.group(1), unit)
-
-              # Alternative MEGAcmd builds display the Cloud drive total separately.
-              cloud_match = re.search(
-                  r"Cloud drive:\s*([\d,]+(?:\.\d+)?)\s*(B|KB|KIB|MB|MIB|GB|GIB|TB|TIB)\b",
-                  output, re.IGNORECASE
-              )
-              if cloud_match:
-                  return _mega_size_to_bytes(cloud_match.group(1), cloud_match.group(2))
-
-              # Last-resort calculation from the documented percentage/total line.
-              pct_match = re.search(
-                  r"([\d.]+)%\s+of\s+([\d.]+)\s*(B|KB|KIB|MB|MIB|GB|GIB|TB|TIB)",
-                  output, re.IGNORECASE
-              )
-              if pct_match:
-                  pct = float(pct_match.group(1))
-                  total_bytes = _mega_size_to_bytes(pct_match.group(2), pct_match.group(3))
-                  return int((pct / 100.0) * total_bytes)
-
-              raise RuntimeError("Could not parse MEGA storage usage from mega-df -h output: " + output[-1200:])
-
-          def get_mega_transfer_snapshot():
-              """Read the active MEGAcmd transfer list for progress telemetry."""
-              try:
-                  result = subprocess.run(
-                      ["mega-transfers"], capture_output=True, text=True, timeout=25
-                  )
-                  combined = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-                  return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", combined).strip()[-1800:]
-              except Exception as error:
-                  return "Transfer monitor temporarily unavailable: " + str(error)
-
-          def run_mega_put_with_heartbeat(file_path, file_name, account_email):
-              """Run mega-put without pipe backpressure and report live transfer status."""
-              command = ["mega-put", file_path, "/"]
-              print("::notice title=MEGA Upload Started::Account " + account_email + " | " + file_name, flush=True)
-              print("MEGA command: mega-put <local-file> /", flush=True)
-
-              # A regular temporary file avoids blocking MEGAcmd if its progress
-              # output uses carriage returns instead of newline-terminated lines.
-              with tempfile.TemporaryFile(mode="w+b") as command_log:
-                  process = subprocess.Popen(command, stdout=command_log, stderr=subprocess.STDOUT)
-                  log_position = 0
-                  last_heartbeat = 0
-                  started = time.time()
-                  max_seconds = 7200
-
-                  def flush_new_command_output():
-                      nonlocal log_position
-                      try:
-                          current_size = os.fstat(command_log.fileno()).st_size
-                          if current_size <= log_position:
-                              return ""
-                          chunk = os.pread(command_log.fileno(), current_size - log_position, log_position)
-                          log_position = current_size
-                          decoded = chunk.decode("utf-8", errors="replace")
-                          for raw_line in re.split(r"[\r\n]+", decoded):
-                              line = raw_line.strip()
-                              if line:
-                                  print("[MEGA] " + line, flush=True)
-                          return decoded
-                      except Exception as log_error:
-                          print("::warning::Could not read MEGA command output: " + str(log_error), flush=True)
-                          return ""
-
-                  try:
-                      while process.poll() is None:
-                          now = time.time()
-                          flush_new_command_output()
-                          if now - started > max_seconds:
-                              process.terminate()
-                              try:
-                                  process.wait(timeout=20)
-                              except subprocess.TimeoutExpired:
-                                  process.kill()
-                              raise subprocess.TimeoutExpired(command, max_seconds)
-
-                          if now - last_heartbeat >= 20:
-                              snapshot = get_mega_transfer_snapshot()
-                              summary = snapshot if snapshot else "MEGAcmd has not emitted a transfer row yet."
-                              send_status(
-                                  "MEGA upload in progress",
-                                  "mega",
-                                  "Account: " + account_email + " | File: " + file_name + " | Transfer status: " + summary[:1200]
-                              )
-                              print("::notice title=MEGA Transfer Progress::" + account_email + " | " + (summary[:700] or "Transfer is active"), flush=True)
-                              last_heartbeat = now
-                          time.sleep(3)
-
-                      # Drain the command log after process completion.
-                      flush_new_command_output()
-                      return_code = process.returncode
-                      command_log.seek(0)
-                      all_output = command_log.read().decode("utf-8", errors="replace")
-                      if return_code != 0:
-                          raise RuntimeError(
-                              "mega-put exited with code " + str(return_code) + ": " +
-                              (all_output[-1800:] or "No command output was returned.")
-                          )
-                      return all_output[-1800:]
-
-                  except JobCancelled:
-                      try:
-                          subprocess.run(["mega-cancel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
-                      except Exception:
-                          pass
-                      try:
-                          process.terminate()
-                          process.wait(timeout=15)
-                      except Exception:
-                          try:
-                              process.kill()
-                          except Exception:
-                              pass
-                      raise
-                  finally:
-                      if process.poll() is None:
-                          try:
-                              process.terminate()
-                              process.wait(timeout=10)
-                          except Exception:
-                              try:
-                                  process.kill()
-                              except Exception:
-                                  pass
+              if match:
+                  pct = float(match.group(1))
+                  total_gb = float(match.group(2))
+                  return int((pct / 100.0) * total_gb * (1024 ** 3))
+              return None
 
           def upload_to_pixeldrain(file_path, file_name):
               if not PIXELDRAIN_API:
@@ -523,148 +219,112 @@ jobs:
                   )
               return "https://pixeldrain.com/u/" + str(data["id"])
 
-          def mega_accounts():
-              return [
+          def upload_to_mega(file_path, file_name, file_size):
+              accounts = [
                   line.strip()
                   for line in MEGA_ACCOUNTS_RAW.splitlines()
                   if ":" in line.strip()
               ]
-
-          def mega_logout():
-              subprocess.run(
-                  ["mega-logout"],
-                  stdout=subprocess.DEVNULL,
-                  stderr=subprocess.DEVNULL,
-                  timeout=30,
-              )
-
-          def export_mega_link(remote_path):
-              export_result = subprocess.run(
-                  ["mega-export", "-a", remote_path],
-                  capture_output=True,
-                  text=True,
-                  timeout=180,
-              )
-              if export_result.returncode != 0:
-                  raise RuntimeError(
-                      f"MEGA file exists but link export failed: {(export_result.stderr or export_result.stdout)[:700]}"
-                  )
-              match = re.search(r"(https://mega\.nz/\S+)", export_result.stdout or "")
-              if not match:
-                  raise RuntimeError("MEGA file exists, but mega-export did not return a public link.")
-              return match.group(1).rstrip("\r\n")
-
-          def find_exact_mega_path_for_current_account(file_name):
-              """Only used after an uncertain put, and only in the account already logged in."""
-              find_result = subprocess.run(
-                  ["mega-find", "/", "--type=f"],
-                  capture_output=True,
-                  text=True,
-                  timeout=900,
-              )
-              if find_result.returncode != 0:
-                  raise RemoteUploadStateUnknown(
-                      "MEGA upload result is uncertain and the currently selected account could not be checked: "
-                      + (find_result.stderr or find_result.stdout or "mega-find failed")[:700]
-                  )
-              for raw_line in (find_result.stdout or "").splitlines():
-                  remote_path = raw_line.strip().strip('"')
-                  if not remote_path.startswith("/"):
-                      continue
-                  if os.path.basename(remote_path.rstrip("/")) == file_name:
-                      return remote_path
-              return None
-
-          def upload_to_mega(file_path, file_name, file_size):
-              """Upload only after WordPress's complete Cloud File Index confirms no exact name exists."""
-              accounts = mega_accounts()
               if not accounts:
                   raise RuntimeError("No MEGA accounts are configured in WordPress.")
 
               max_limit_bytes = int(19.8 * (1024 ** 3))
-              last_error = "No configured MEGA account had enough storage or could complete the upload. See the per-account capacity and MEGA transfer notices above."
+              last_error = "No MEGA account had enough storage or could upload."
 
-              # IMPORTANT: do not scan the file trees of every account here.
-              # A full filename inventory is maintained by the separate weekly/manual
-              # Cloud File Index job. This loop checks storage capacity only.
               for index, account in enumerate(accounts, start=1):
                   email, password = account.split(":", 1)
-                  email, password = email.strip(), password.strip()
-                  print(f"Checking MEGA storage capacity {index}/{len(accounts)}: {email}")
-                  mega_logout()
-                  logged_in = False
+                  email = email.strip()
+                  password = password.strip()
+                  print(f"Checking MEGA account {index}/{len(accounts)}: {email}")
+                  subprocess.run(
+                      ["mega-logout"], stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL, timeout=30
+                  )
+
                   try:
                       login = subprocess.run(
                           ["mega-login", email, password],
-                          capture_output=True,
-                          text=True,
-                          timeout=180,
+                          capture_output=True, text=True, timeout=90
                       )
                       if login.returncode != 0:
                           last_error = f"MEGA login failed for {email}: {(login.stderr or login.stdout)[:500]}"
                           print("::warning::", last_error)
                           continue
-                      logged_in = True
+
+                      # Keep the existing rubbish-bin cleanup behaviour.
+                      subprocess.run(
+                          ["mega-rm", "-r", "-f", "//bin/*"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=120
+                      )
 
                       used_bytes = get_mega_used_bytes()
-                      projected_bytes = used_bytes + file_size
-                      used_gb = used_bytes / (1024 ** 3)
-                      file_gb = file_size / (1024 ** 3)
-                      projected_gb = projected_bytes / (1024 ** 3)
-                      free_under_cap_gb = max(0.0, (max_limit_bytes - used_bytes) / (1024 ** 3))
-                      capacity_message = (
-                          f"{email}: used {used_gb:.2f} GiB; free under CLOBD 19.8 GiB cap "
-                          f"{free_under_cap_gb:.2f} GiB; file {file_gb:.2f} GiB; "
-                          f"projected {projected_gb:.2f} GiB."
-                      )
-                      print("::notice title=MEGA Account Capacity::" + capacity_message, flush=True)
-                      send_status("MEGA account capacity checked", "mega", capacity_message)
-                      if projected_bytes > max_limit_bytes:
-                          last_error = f"Not enough storage in {email}; {capacity_message} Checking the next account."
-                          print("::notice title=MEGA Account Skipped::" + last_error, flush=True)
-                          send_status("MEGA account skipped", "mega", last_error)
+                      if used_bytes is None:
+                          last_error = f"Could not read MEGA storage for {email}; trying next account."
+                          print("::warning::", last_error)
+                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                           continue
 
-                      send_status("Starting MEGA upload", "mega", f"Selected account: {email}. Exact filename is absent from the complete Cloud File Index. Uploading one copy only.")
-                      try:
-                          put_output = run_mega_put_with_heartbeat(file_path, file_name, email)
-                      except subprocess.TimeoutExpired as timeout_error:
-                          # An interrupted transfer can still leave a completed remote file.
-                          # Check only this account and never fail over on uncertain state.
-                          matching_path = find_exact_mega_path_for_current_account(file_name)
-                          if matching_path:
-                              link = export_mega_link(matching_path)
-                              return link, email, True, matching_path
-                          raise RemoteUploadStateUnknown(
-                              f"MEGA upload to {email} exceeded the 120-minute safety limit and no exact remote file was found. "
-                              "No other account was attempted. Refresh Cloud File Index before retrying."
-                          ) from timeout_error
+                      projected_bytes = used_bytes + file_size
+                      used_gb = round(used_bytes / (1024 ** 3), 2)
+                      projected_gb = round(projected_bytes / (1024 ** 3), 2)
+                      print(
+                          f"MEGA account {email}: used {used_gb} GB, "
+                          f"projected {projected_gb} GB / 19.8 GB"
+                      )
 
-                      if put_output:
-                          print("MEGA upload command output (tail):\n" + put_output[-1600:], flush=True)
+                      if projected_bytes > max_limit_bytes:
+                          last_error = f"Not enough available storage in {email}; trying next account."
+                          print("::notice::", last_error)
+                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          continue
 
+                      send_status("Uploading file to MEGA", "mega", f"Uploading to {email}")
                       remote_path = "/" + file_name
-                      try:
-                          link = export_mega_link(remote_path)
-                      except Exception as export_error:
-                          raise RemoteUploadStateUnknown(
-                              f"MEGA upload succeeded in {email}, but link export failed. The file remains in MEGA; "
-                              "no other account was attempted. " + str(export_error)
-                          ) from export_error
+                      subprocess.run(
+                          ["mega-rm", "-f", remote_path],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=60
+                      )
+                      put_result = subprocess.run(
+                          ["mega-put", file_path, "/"],
+                          capture_output=True, text=True, timeout=7200
+                      )
+                      if put_result.returncode != 0:
+                          last_error = f"MEGA upload failed for {email}: {(put_result.stderr or put_result.stdout)[:700]}"
+                          print("::warning::", last_error)
+                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          continue
 
-                      print(f"::notice title=MEGA Upload Success::{email} uploaded {file_name} ({projected_gb} / 19.8 GB used).")
-                      return link, email, False, remote_path
+                      export_result = subprocess.run(
+                          ["mega-export", "-a", remote_path],
+                          capture_output=True, text=True, timeout=120
+                      )
+                      if export_result.returncode != 0:
+                          last_error = f"MEGA export failed for {email}: {(export_result.stderr or export_result.stdout)[:700]}"
+                          print("::warning::", last_error)
+                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          continue
+
+                      match = re.search(r"(https://mega\.nz/\S+)", export_result.stdout or "")
+                      if not match:
+                          last_error = f"MEGA uploaded to {email}, but no public link was returned."
+                          print("::warning::", last_error)
+                          subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          continue
+
+                      link = match.group(1).rstrip("\r\n")
+                      subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      return link, email
 
                   except JobCancelled:
-                      raise
-                  except RemoteUploadStateUnknown:
+                      subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                       raise
                   except Exception as error:
                       last_error = f"MEGA account {email} error: {error}"
                       print("::warning::", last_error)
-                  finally:
-                      if logged_in:
-                          mega_logout()
+                      subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      continue
 
               raise RuntimeError(last_error)
 
@@ -673,7 +333,6 @@ jobs:
           pixeldrain_url = ""
           mega_url = ""
           used_mega_account = ""
-          mega_remote_path = ""
           file_path = ""
           file_name = ""
           errors = []
@@ -682,210 +341,64 @@ jobs:
           try:
               if not POST_ID or not GDRIVE_ID:
                   raise RuntimeError("Post ID or Google Drive file ID is missing.")
-              if QUEUE_ID and (not PLATFORM_RESULT_URL or not INDEX_LOOKUP_URL):
-                  raise RuntimeError("WordPress platform-result or cloud-index lookup URL is missing.")
               if not NEED_PD and not NEED_MEGA:
                   raise RuntimeError("No upload destination was selected for this queue job.")
 
-              send_status("Resolving exact filename from WordPress Queue", "WordPress", "Using the filename already stored for this post (preferring a previously confirmed remote filename). No separate Google Drive metadata subprocess is started.")
-              # The queue lookup endpoint returns the exact stored filename. For
-              # posts where a cloud upload has already succeeded, WordPress prefers
-              # the filename confirmed by that platform over the editable post title.
-              # This removes the slow gdown --json subprocess that was being cancelled
-              # before the actual upload stage on some GitHub-hosted runners.
-              inventory = lookup_cloud_index("")
-              file_name = os.path.basename(str(inventory.get("file_name") or "")).strip()
-              if not file_name or file_name in (".", "..") or file_name.lower().startswith("cloud file -"):
-                  raise RuntimeError("WordPress Queue has no usable exact source filename. Set the File post title to the original full filename, including extension, then retry.")
-              print("::notice title=Source Filename::" + file_name, flush=True)
+              send_status("GitHub runner started", "Preparing", "Runner is starting the file job.")
+              send_status("Downloading source from Google Drive", "Google Drive", "Downloading the source file.")
 
-              send_status("Checking WordPress Cloud File Index", "Cloud File Index", "Looking up the exact case-sensitive filename " + file_name + " in the stored PixelDrain and MEGA inventories.")
-              pd_candidates = inventory.get("pixeldrain") or []
-              mega_candidates = inventory.get("mega") or []
-              pd_will_upload = False
-              mega_will_upload = False
+              drive_url = f"https://drive.google.com/uc?id={GDRIVE_ID}"
+              # Keep this call compatible with gdown releases that do not expose
+              # the optional `fuzzy` argument. The direct Drive URL already
+              # contains the file ID, so fuzzy URL parsing is unnecessary.
+              downloaded_path = gdown.download(
+                  url=drive_url,
+                  output=None,
+                  quiet=False,
+              )
+              if not downloaded_path or not os.path.isfile(downloaded_path):
+                  raise RuntimeError("Google Drive download failed or returned no file.")
 
-              # PixelDrain: use a stored exact filename match. Do not GET the full account list here.
-              pd_error = None
-              mega_error = None
+              file_path = os.path.abspath(downloaded_path)
+              file_name = os.path.basename(file_path)
+              file_size = os.path.getsize(file_path)
+              if file_size <= 0:
+                  raise RuntimeError("The downloaded file is empty.")
+              download_ok = True
+              print(
+                  f"::notice title=Downloaded::{file_name} "
+                  f"({round(file_size / (1024 ** 3), 3)} GB)"
+              )
+
               if NEED_PD:
-                  if pd_candidates:
-                      for candidate in pd_candidates:
-                          try:
-                              indexed_url = verify_indexed_pixeldrain(candidate, file_name)
-                              if indexed_url:
-                                  pixeldrain_url = indexed_url
-                                  pd_status = "success"
-                                  pd_message = "Exact filename already existed in the Cloud File Index; reused the existing PixelDrain file without uploading a duplicate."
-                                  print("::notice title=PixelDrain Duplicate Found::" + indexed_url)
-                                  saved, save_error = report_platform_result("pixeldrain", pixeldrain_url, "PixelDrain", pd_message)
-                                  if not saved:
-                                      errors.append("PixelDrain link was found but WordPress persistence failed: " + save_error)
-                                  break
-                          except Exception as error:
-                              pd_error = error
-                              break
-                      if pd_error:
-                          pd_status = "failed"
-                          errors.append("PixelDrain index verification was uncertain; no duplicate upload was attempted: " + str(pd_error))
-                          send_status("PixelDrain verification blocked", "pixeldrain", str(pd_error)[:900])
-                  if pd_status != "success" and not pd_error:
-                      if not inventory.get("pixeldrain_complete"):
-                          pd_status = "failed"
-                          errors.append("PixelDrain inventory is incomplete or older than seven days. Run Files → Cloud File Index → Sync Now; no duplicate-risk upload was attempted.")
-                      else:
-                          pd_will_upload = True
-
-              # MEGA: login only to the account/path returned by the index. If no match,
-              # a new upload is permitted only when every configured account was indexed successfully.
-              if NEED_MEGA:
-                  if mega_candidates:
-                      indexed_errors = []
-                      for candidate in mega_candidates:
-                          try:
-                              indexed_url, indexed_account, indexed_path = report_indexed_mega(candidate, file_name)
-                              mega_url = indexed_url
-                              used_mega_account = indexed_account
-                              mega_remote_path = indexed_path
-                              mega_status = "success"
-                              mega_message = "Exact filename already existed in the Cloud File Index; exported the existing MEGA file without scanning all accounts or uploading a duplicate."
-                              print("::notice title=MEGA Duplicate Found::Reusing indexed file in " + indexed_account + " at " + indexed_path)
-                              saved, save_error = report_platform_result("mega", mega_url, used_mega_account, mega_message, indexed_path)
-                              if not saved:
-                                  errors.append("MEGA link was found but WordPress persistence failed: " + save_error)
-                              break
-                          except JobCancelled:
-                              raise
-                          except Exception as error:
-                              # Another MEGA account may contain a second exact-name copy.
-                              # Try every indexed candidate before deciding that none can be reused.
-                              indexed_errors.append(str(error))
-                              print("::warning title=Indexed MEGA copy unavailable::" + str(error)[:700])
-                      if mega_status != "success":
-                          mega_error = RuntimeError(" | ".join(indexed_errors[:10]) or "MEGA index contains exact-name rows but no usable link could be exported.")
-                          mega_status = "failed"
-                          errors.append("MEGA index matched one or more files, but none of the indexed copies could be exported. No new upload was attempted to avoid a duplicate: " + str(mega_error))
-                          send_status("MEGA verification blocked", "mega", str(mega_error)[:900])
-                  else:
-                      if not inventory.get("mega_complete"):
-                          mega_status = "failed"
-                          errors.append("MEGA inventory is incomplete or older than seven days. Run Files → Cloud File Index → Sync Now; MEGA upload was blocked to avoid a duplicate.")
-                      else:
-                          mega_will_upload = True
-
-              # If the exact file already exists on every selected destination, no source
-              # download is needed at all. The existing links have already been persisted.
-              if not pd_will_upload and not mega_will_upload:
-                  download_ok = True
-                  print("::notice title=Source Download Skipped::All selected backup platforms already contain this exact filename.")
-              else:
-                  send_status("Downloading source from Google Drive", "Google Drive", "Downloading only because at least one selected platform has no exact indexed match.")
-                  drive_url = f"https://drive.google.com/uc?id={GDRIVE_ID}"
-                  safe_name = os.path.basename(file_name)
-                  output_path = os.path.join(DOWNLOAD_DIR, safe_name)
-                  last_percent = [-1]
-                  progress_state = {"bytes_done": 0, "bytes_total": None}
-                  download_heartbeat_stop = threading.Event()
-                  download_cancel_event = threading.Event()
-
-                  def on_download_progress(bytes_done, bytes_total):
-                      progress_state["bytes_done"] = int(bytes_done)
-                      progress_state["bytes_total"] = (int(bytes_total) if bytes_total is not None else None)
-                      percent = int((bytes_done / bytes_total) * 100) if bytes_total else -1
-                      if percent >= 0 and percent != last_percent[0] and (percent % 5 == 0):
-                          print(f"Download progress: {percent}% ({bytes_done}/{bytes_total} bytes)", flush=True)
-                          last_percent[0] = percent
-
-                  def download_status_heartbeat():
-                      # Independent heartbeat keeps WordPress updated even when
-                      # gdown is waiting for a slow HTTP response between chunks.
-                      while not download_heartbeat_stop.wait(20):
-                          done = progress_state["bytes_done"]
-                          total = progress_state["bytes_total"]
-                          percent = int((done / total) * 100) if total else None
-                          stage = (f"Downloading source from Google Drive ({percent}%)"
-                                   if percent is not None else "Downloading source from Google Drive")
-                          try:
-                              send_status(
-                                  stage,
-                                  "Google Drive",
-                                  f"Downloaded {done} bytes so far; gdown retries/resume are enabled. Runner heartbeat is active."
-                              )
-                          except JobCancelled:
-                              download_cancel_event.set()
-                              return
-
-                  heartbeat_thread = threading.Thread(
-                      target=download_status_heartbeat,
-                      name="clobd-download-heartbeat",
-                      daemon=True,
-                  )
-                  heartbeat_thread.start()
+                  send_status("Uploading file to Pixeldrain", "pixeldrain", "Pixeldrain upload is in progress.")
                   try:
-                      downloaded_path = gdown.download(
-                          url=drive_url,
-                          output=output_path,
-                          quiet=False,
-                          resume=True,
-                          retries=5,
-                          timeout=(30, 120),
-                          progress=on_download_progress,
-                          cancel=download_cancel_event,
-                      )
-                  except Exception:
-                      if download_cancel_event.is_set():
-                          raise JobCancelled("Download stopped because this queue job was cancelled in WordPress.")
+                      pixeldrain_url = upload_to_pixeldrain(file_path, file_name)
+                      pd_status = "success"
+                      print("::notice title=Pixeldrain Success::" + pixeldrain_url)
+                  except JobCancelled:
                       raise
-                  finally:
-                      download_heartbeat_stop.set()
-                      heartbeat_thread.join(timeout=5)
-                  if download_cancel_event.is_set():
-                      raise JobCancelled("Download stopped because this queue job was cancelled in WordPress.")
-                  if not downloaded_path or not os.path.isfile(downloaded_path):
-                      raise RuntimeError("Google Drive download failed or returned no file after automatic retries.")
-                  file_path = os.path.abspath(downloaded_path)
-                  file_name = os.path.basename(file_path)
-                  file_size = os.path.getsize(file_path)
-                  if file_size <= 0:
-                      raise RuntimeError("The downloaded file is empty.")
-                  download_ok = True
-                  print(f"::notice title=Downloaded::{file_name} ({round(file_size / (1024 ** 3), 3)} GB)")
+                  except Exception as error:
+                      pd_status = "failed"
+                      errors.append("Pixeldrain: " + str(error))
+                      print("::error title=Pixeldrain Upload Failed::" + str(error))
+                      send_status("Pixeldrain upload failed", "pixeldrain", str(error)[:900])
 
-                  if pd_will_upload:
-                      try:
-                          send_status("Uploading file to Pixeldrain", "pixeldrain", "Cloud index confirmed no exact filename match.")
-                          pixeldrain_url = upload_to_pixeldrain(file_path, file_name)
-                          pd_status = "success"
-                          pd_message = "PixelDrain upload completed; link is being saved immediately in WordPress and the cloud index."
-                          saved, save_error = report_platform_result("pixeldrain", pixeldrain_url, "PixelDrain", pd_message)
-                          if not saved:
-                              errors.append("PixelDrain upload succeeded but immediate WordPress persistence failed: " + save_error)
-                      except JobCancelled:
-                          raise
-                      except Exception as error:
-                          pd_status = "failed"
-                          errors.append("Pixeldrain: " + str(error))
-                          print("::error title=Pixeldrain Failed::" + str(error))
-                          send_status("Pixeldrain check/upload failed", "pixeldrain", str(error)[:900])
-
-                  if mega_will_upload:
-                      try:
-                          send_status("Checking MEGA account capacity", "mega", "No exact filename match exists in the complete index. Checking account capacity only; no full-account duplicate scan is performed.")
-                          mega_url, used_mega_account, mega_was_existing, mega_remote_path = upload_to_mega(
-                              file_path, file_name, file_size
-                          )
-                          mega_status = "success"
-                          mega_message = "MEGA upload completed successfully." if not mega_was_existing else "The exact file was confirmed after upload uncertainty; existing link reused."
-                          saved, save_error = report_platform_result("mega", mega_url, used_mega_account, mega_message, mega_remote_path)
-                          if not saved:
-                              errors.append("MEGA upload succeeded but immediate WordPress persistence failed: " + save_error)
-                      except JobCancelled:
-                          raise
-                      except Exception as error:
-                          mega_status = "failed"
-                          errors.append("MEGA: " + str(error))
-                          print("::error title=MEGA Failed::" + str(error))
-                          send_status("MEGA upload failed", "mega", str(error)[:900])
+              if NEED_MEGA:
+                  send_status("Checking MEGA accounts and storage", "mega", "Checking configured MEGA accounts.")
+                  try:
+                      mega_url, used_mega_account = upload_to_mega(
+                          file_path, file_name, file_size
+                      )
+                      mega_status = "success"
+                      print("::notice title=MEGA Success::" + used_mega_account + " uploaded the file.")
+                  except JobCancelled:
+                      raise
+                  except Exception as error:
+                      mega_status = "failed"
+                      errors.append("MEGA: " + str(error))
+                      print("::error title=MEGA Upload Failed::" + str(error))
+                      send_status("MEGA upload failed", "mega", str(error)[:900])
 
           except JobCancelled as cancelled:
               print("::notice title=Cancelled::" + str(cancelled))
@@ -908,8 +421,7 @@ jobs:
               send_final_callback(
                   file_name, pixeldrain_url, mega_url, used_mega_account,
                   pd_status, mega_status,
-                  "; ".join(errors) if errors else "Requested upload destination(s) processed.",
-                  mega_remote_path
+                  "; ".join(errors) if errors else "Requested upload destination(s) processed."
               )
           except JobCancelled as cancelled:
               print("::notice title=Cancelled::" + str(cancelled))
@@ -918,193 +430,6 @@ jobs:
               print("::error title=WordPress Callback Failed::" + str(error))
               sys.exit(1)
 
-          success = (not NEED_PD or pd_status == "success") and (not NEED_MEGA or mega_status == "success") and (download_ok or (pd_status == "success" and mega_status == "success"))
+          success = (not NEED_PD or pd_status == "success") and (not NEED_MEGA or mega_status == "success") and download_ok
           if not success:
               sys.exit(1)
-
-  cloud_index_sync:
-    if: github.event.action == 'sync_cloud_index'
-    concurrency:
-      group: clobd-cloud-index-sync-${{ github.repository }}
-      cancel-in-progress: false
-      queue: max
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.11'
-
-      - name: Install MEGAcmd and Python Dependencies
-        run: |
-          python3 -m pip install --upgrade pip requests
-          wget -q "https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb"
-          sudo apt-get update
-          sudo apt-get install -y "./megacmd-xUbuntu_22.04_amd64.deb" || sudo apt-get install -f -y
-
-      - name: Record index runner diagnostics
-        run: |
-          echo "Runner image: ubuntu-22.04"
-          echo "GitHub run: $GITHUB_RUN_ID / attempt $GITHUB_RUN_ATTEMPT"
-          date -u
-          cat /etc/os-release | head -n 8
-          df -h "$GITHUB_WORKSPACE"
-
-      - name: Build PixelDrain and MEGA Cloud File Index
-        shell: python
-        env:
-          SYNC_ID: ${{ github.event.client_payload.sync_id }}
-          INDEX_URL: ${{ github.event.client_payload.index_url }}
-          WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
-          PIXELDRAIN_API: ${{ github.event.client_payload.pixeldrain_api }}
-          MEGA_ACCOUNTS: ${{ github.event.client_payload.mega_accounts }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          import os, sys, json, time, hashlib, subprocess, requests
-
-          SYNC_ID = os.environ.get("SYNC_ID", "").strip()
-          INDEX_URL = os.environ.get("INDEX_URL", "").strip()
-          SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
-          PD_API = os.environ.get("PIXELDRAIN_API", "").strip()
-          ACCOUNTS_RAW = os.environ.get("MEGA_ACCOUNTS", "")
-          RUN_ID = os.environ.get("RUN_ID", "")
-
-          if not SYNC_ID or not INDEX_URL or not SECRET:
-              raise SystemExit("Missing cloud-index sync configuration.")
-
-          stats = {"pixeldrain": 0, "mega": 0}
-          pixel_complete = False
-          mega_complete = False
-          failures = []
-
-          def post_index(action, **extra):
-              payload = {"webhook_secret": SECRET, "sync_id": SYNC_ID, "action": action, **extra}
-              last_error = None
-              for attempt in range(1, 5):
-                  try:
-                      response = requests.post(INDEX_URL, json=payload, timeout=90,
-                                               headers={"User-Agent": "CLOBD-Cloud-Index-Sync"})
-                      response.raise_for_status()
-                      data = response.json()
-                      if not data.get("success", True):
-                          raise RuntimeError(str(data))
-                      return data
-                  except Exception as error:
-                      last_error = error
-                      print(f"Index callback attempt {attempt}/4 failed: {error}")
-                      if attempt < 4:
-                          time.sleep(attempt * 4)
-              raise RuntimeError("Could not persist cloud index data to WordPress: " + str(last_error))
-
-          def send_batches(platform, entries, batch_size=100):
-              for start in range(0, len(entries), batch_size):
-                  batch = entries[start:start + batch_size]
-                  post_index("batch", entries=batch)
-                  print(f"Saved {platform} index entries: {min(start + len(batch), len(entries))}/{len(entries)}")
-
-          def mega_logout():
-              subprocess.run(["mega-logout"], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, timeout=45)
-
-          def parse_mega_find(stdout):
-              rows = []
-              for raw in (stdout or "").splitlines():
-                  path = raw.strip().strip('"')
-                  if not path.startswith("/"):
-                      continue
-                  name = path.rstrip("/").rsplit("/", 1)[-1]
-                  if not name:
-                      continue
-                  rows.append({"platform": "mega", "account": "", "file_name": name,
-                               "remote_path": path, "remote_id": "", "remote_url": "", "file_size": 0})
-              return rows
-
-          post_index("start", run_id=RUN_ID)
-
-          # PixelDrain exposes a single authenticated account inventory (up to 50,000 files).
-          post_index("progress", run_id=RUN_ID, message="Fetching PixelDrain account file inventory.")
-          if not PD_API:
-              failures.append("PixelDrain API key is missing; PixelDrain index was not refreshed.")
-          else:
-              try:
-                  response = requests.get("https://pixeldrain.com/api/user/files", auth=("", PD_API),
-                                          headers={"Accept": "application/json"}, timeout=(30, 180))
-                  response.raise_for_status()
-                  data = response.json()
-                  files = data.get("files") if isinstance(data, dict) else None
-                  if not isinstance(files, list):
-                      raise RuntimeError("Pixeldrain /api/user/files returned no files array.")
-                  entries = []
-                  for item in files:
-                      if not isinstance(item, dict) or not item.get("id") or not item.get("name"):
-                          continue
-                      file_id = str(item["id"])
-                      entries.append({"platform": "pixeldrain", "account": "PixelDrain",
-                                      "file_name": str(item["name"]), "remote_path": file_id,
-                                      "remote_id": file_id, "remote_url": "https://pixeldrain.com/u/" + file_id,
-                                      "file_size": int(item.get("size") or 0)})
-                  send_batches("PixelDrain", entries)
-                  # The API documents a 50,000-entry maximum; exactly at the cap may be truncated.
-                  pixel_complete = len(files) < 50000
-                  post_index("platform_complete", platform="pixeldrain", complete=pixel_complete)
-                  stats["pixeldrain"] = len(entries)
-                  if not pixel_complete:
-                      failures.append("PixelDrain returned its 50,000-file cap; coverage is marked incomplete to avoid duplicate uploads.")
-              except Exception as error:
-                  failures.append("PixelDrain inventory failed: " + str(error))
-                  print("::error title=PixelDrain index failed::" + str(error))
-
-          # MEGA: one inventory scan per account during this sync, not during every file upload.
-          accounts = [line.strip() for line in ACCOUNTS_RAW.splitlines() if ":" in line.strip()]
-          mega_success_count = 0
-          if not accounts:
-              failures.append("No MEGA accounts are configured; MEGA index was not refreshed.")
-          for number, account in enumerate(accounts, start=1):
-              email, password = account.split(":", 1)
-              email, password = email.strip(), password.strip()
-              print(f"Indexing MEGA account {number}/{len(accounts)}: {email}")
-              post_index("progress", run_id=RUN_ID, message=f"Indexing MEGA account {number}/{len(accounts)}: {email}. This is a one-time inventory sync, not part of normal uploads.")
-              mega_logout()
-              try:
-                  login = subprocess.run(["mega-login", email, password], capture_output=True,
-                                         text=True, timeout=180)
-                  if login.returncode != 0:
-                      raise RuntimeError((login.stderr or login.stdout or "MEGA login failed")[:700])
-                  result = subprocess.run(["mega-find", "/", "--type=f"], capture_output=True,
-                                          text=True, timeout=3600)
-                  if result.returncode != 0:
-                      raise RuntimeError((result.stderr or result.stdout or "mega-find failed")[:700])
-                  entries = parse_mega_find(result.stdout)
-                  for row in entries:
-                      row["account"] = email
-                  send_batches("MEGA", entries)
-                  post_index("account_complete", platform="mega", account=email)
-                  stats["mega"] += len(entries)
-                  mega_success_count += 1
-                  print(f"MEGA inventory completed for {email}: {len(entries)} files.")
-              except Exception as error:
-                  failures.append(f"MEGA account {email} index failed: {error}")
-                  print(f"::error title=MEGA index failed::{email}: {error}")
-              finally:
-                  try:
-                      mega_logout()
-                  except Exception:
-                      pass
-
-          mega_complete = bool(accounts) and mega_success_count == len(accounts)
-          message = (f"Index sync completed. PixelDrain: {stats['pixeldrain']} files; "
-                     f"MEGA: {stats['mega']} files across {mega_success_count}/{len(accounts)} accounts.")
-          if failures:
-              message += " Partial coverage: " + " | ".join(failures[:10])
-          post_index("finish", run_id=RUN_ID, pixeldrain_complete=pixel_complete,
-                     mega_complete=mega_complete, message=message)
-          print(message)
-          if failures:
-              print("::warning title=Cloud index partial::" + " | ".join(failures[:10]))
-          if not pixel_complete or not mega_complete:
-              raise SystemExit(1)
-
