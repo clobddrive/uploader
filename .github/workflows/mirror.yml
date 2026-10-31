@@ -113,6 +113,7 @@ jobs:
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
           PIXELDRAIN_API: ${{ github.event.client_payload.pixeldrain_api }}
           MEGA_ACCOUNTS: ${{ github.event.client_payload.mega_accounts }}
+          PYTHONUNBUFFERED: "1"
         run: |
           import os
           import re
@@ -178,6 +179,7 @@ jobs:
                               raise JobCancelled("This job was cancelled from the WordPress dashboard.")
                       except ValueError:
                           pass
+                      print(f"::notice title=CLOBD Stage::{stage} | {platform or 'system'} | {message}", flush=True)
                       return True
                   except JobCancelled:
                       raise
