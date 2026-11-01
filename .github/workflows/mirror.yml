@@ -81,6 +81,7 @@ jobs:
           DUPLICATE_CHECK_URL: ${{ github.event.client_payload.duplicate_check_url }}
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
           PIXELDRAIN_API: ${{ github.event.client_payload.pixeldrain_api }}
+          FORCE_UPLOAD: ${{ github.event.client_payload.force_upload || 'no' }}
           GOFILE_API_TOKEN: ${{ github.event.client_payload.platform == 'gofile' && secrets.GOFILE_API_TOKEN || '' }}
           GH_RUN_ID: ${{ github.run_id }}
         run: |
@@ -101,6 +102,7 @@ jobs:
           DUPLICATE_CHECK_URL = os.environ.get("DUPLICATE_CHECK_URL", "").strip()
           WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
           PIXELDRAIN_API = os.environ.get("PIXELDRAIN_API", "").strip()
+          FORCE_UPLOAD = os.environ.get("FORCE_UPLOAD", "no").strip().lower() == "yes"
           GOFILE_API_TOKEN = os.environ.get("GOFILE_API_TOKEN", "").strip()
           RUN_ID = os.environ.get("GH_RUN_ID", "").strip()
 
@@ -147,6 +149,9 @@ jobs:
 
           def find_wordpress_duplicate(file_name):
               """Use exact filename plus provider-specific successful queue history."""
+              if FORCE_UPLOAD:
+                  print(f"::notice title=Forced Re-upload::Bypassing prior {PLATFORM} filename history for {file_name}")
+                  return ""
               if not DUPLICATE_CHECK_URL:
                   raise RuntimeError("WordPress duplicate-check endpoint is missing. Upload stopped to avoid duplicate files.")
               response = requests.post(
@@ -232,7 +237,7 @@ jobs:
                   sys.exit(0)
 
               if PLATFORM == "pixeldrain":
-                  existing_id, existing_url = find_exact_pixeldrain_duplicate(file_name)
+                  existing_id, existing_url = ("", "") if FORCE_UPLOAD else find_exact_pixeldrain_duplicate(file_name)
                   if existing_id:
                       result_url = existing_url
                       message = "Skipped upload: a file with this exact filename already exists in the Pixeldrain account. Reusing its existing link."
