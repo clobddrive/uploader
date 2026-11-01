@@ -1,4 +1,4 @@
-name: CLOBD Sequential Pixeldrain Upload Queue
+name: CLOBD Multi-Cloud Sequential Upload Queue
 run-name: "CLOBD Queue Job #${{ github.event.client_payload.job_id }} | ${{ github.event.client_payload.platform }}"
 
 on:
@@ -8,7 +8,7 @@ on:
 # WordPress dispatches only one job at a time. This concurrency group is a
 # second safety layer in case a duplicate dispatch is accidentally sent.
 concurrency:
-  group: clobd-pixeldrain-upload-queue
+  group: clobd-multi-cloud-upload-queue
   cancel-in-progress: false
 
 jobs:
@@ -67,9 +67,9 @@ jobs:
 
       - name: Install Python Dependencies
         run: |
-          python3 -m pip install --upgrade pip gdown requests
+          python3 -m pip install --upgrade pip gdown requests requests-toolbelt
 
-      - name: Download, Check Exact Filename, and Upload to Pixeldrain
+      - name: Download, Check Exact Filename, and Upload to Selected Provider
         shell: python
         env:
           JOB_ID: ${{ github.event.client_payload.job_id }}
@@ -81,10 +81,12 @@ jobs:
           DUPLICATE_CHECK_URL: ${{ github.event.client_payload.duplicate_check_url }}
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
           PIXELDRAIN_API: ${{ github.event.client_payload.pixeldrain_api }}
+          GOFILE_API_TOKEN: ${{ github.event.client_payload.platform == 'gofile' && secrets.GOFILE_API_TOKEN || '' }}
           GH_RUN_ID: ${{ github.run_id }}
         run: |
           import os
           import sys
+          import time
           import traceback
           import requests
           import gdown
@@ -99,10 +101,11 @@ jobs:
           DUPLICATE_CHECK_URL = os.environ.get("DUPLICATE_CHECK_URL", "").strip()
           WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
           PIXELDRAIN_API = os.environ.get("PIXELDRAIN_API", "").strip()
+          GOFILE_API_TOKEN = os.environ.get("GOFILE_API_TOKEN", "").strip()
           RUN_ID = os.environ.get("GH_RUN_ID", "").strip()
 
           HEADERS = {
-              "User-Agent": "CLOBD-GitHub-Actions-Upload-Queue/1.0",
+              "User-Agent": "CLOBD-GitHub-Actions-Multi-Cloud-Queue/1.0",
               "Accept": "application/json",
           }
 
@@ -118,51 +121,37 @@ jobs:
                   "github_run_id": RUN_ID,
               }
               try:
-                  response = requests.post(
-                      PROGRESS_URL,
-                      json=payload,
-                      headers=HEADERS,
-                      timeout=20,
-                  )
+                  response = requests.post(PROGRESS_URL, json=payload, headers=HEADERS, timeout=20)
                   response.raise_for_status()
               except Exception as error:
-                  # Progress reporting is helpful, but a temporary dashboard
-                  # connection issue should not interrupt a valid file upload.
                   print(f"::warning title=Queue Progress Update::{error}")
 
-          def send_final_result(result_status, file_name="", pixeldrain_url="", message=""):
+          def send_final_result(result_status, file_name="", result_url="", message=""):
               if not CALLBACK_URL or not WEBHOOK_SECRET:
                   raise RuntimeError("WordPress callback URL or webhook secret is missing.")
-
               payload = {
                   "webhook_secret": WEBHOOK_SECRET,
                   "job_id": JOB_ID,
                   "post_id": POST_ID,
+                  "platform": PLATFORM,
                   "file_name": file_name,
-                  "pixeldrain_url": pixeldrain_url,
+                  "result_url": result_url,
+                  "pixeldrain_url": result_url if PLATFORM == "pixeldrain" else "",
+                  "gofile_url": result_url if PLATFORM == "gofile" else "",
                   "result_status": result_status,
                   "message": message,
               }
-              response = requests.post(
-                  CALLBACK_URL,
-                  json=payload,
-                  headers=HEADERS,
-                  timeout=45,
-              )
+              response = requests.post(CALLBACK_URL, json=payload, headers=HEADERS, timeout=45)
               response.raise_for_status()
               print(f"::notice title=WordPress Queue Updated::HTTP {response.status_code} - {response.text[:500]}")
 
           def find_wordpress_duplicate(file_name):
-              """Search historical WordPress upload records using an exact filename."""
+              """Use exact filename plus provider-specific successful queue history."""
               if not DUPLICATE_CHECK_URL:
                   raise RuntimeError("WordPress duplicate-check endpoint is missing. Upload stopped to avoid duplicate files.")
-
               response = requests.post(
                   DUPLICATE_CHECK_URL,
-                  json={
-                      "webhook_secret": WEBHOOK_SECRET,
-                      "file_name": file_name,
-                  },
+                  json={"webhook_secret": WEBHOOK_SECRET, "file_name": file_name, "platform": PLATFORM},
                   headers=HEADERS,
                   timeout=(20, 120),
               )
@@ -170,13 +159,12 @@ jobs:
               data = response.json()
               if not isinstance(data, dict) or data.get("success") is not True:
                   raise RuntimeError("WordPress duplicate-check endpoint did not return a valid result.")
-
-              if data.get("duplicate") and data.get("pixeldrain_url"):
-                  return str(data.get("pixeldrain_url"))
+              if data.get("duplicate"):
+                  return str(data.get("result_url") or data.get("pixeldrain_url") or data.get("gofile_url") or "").strip()
               return ""
 
-          def find_exact_duplicate(file_name):
-              """Return (file_id, url) for an exact-name match in this API account."""
+          def find_exact_pixeldrain_duplicate(file_name):
+              """Return (file_id, url) for an exact-name match in the Pixeldrain API account."""
               response = requests.get(
                   "https://pixeldrain.com/api/user/files",
                   auth=("", PIXELDRAIN_API),
@@ -184,37 +172,32 @@ jobs:
                   timeout=(20, 90),
               )
               response.raise_for_status()
-
               try:
                   data = response.json()
               except ValueError as error:
                   raise RuntimeError("Pixeldrain account file-list API returned invalid JSON.") from error
-
               files = data.get("files") if isinstance(data, dict) else None
               if not isinstance(files, list):
                   raise RuntimeError("Pixeldrain account file-list API did not return a valid files array. Upload stopped to prevent a duplicate.")
-
-              # Exact, case-sensitive comparison. Similar titles are not duplicates.
               for item in files:
-                  if not isinstance(item, dict):
-                      continue
-                  if item.get("name") == file_name and item.get("id"):
+                  if isinstance(item, dict) and item.get("name") == file_name and item.get("id"):
                       file_id = str(item["id"]).strip()
                       return file_id, f"https://pixeldrain.com/u/{quote(file_id, safe='')}"
-
               return "", ""
 
           file_name = ""
-          pixeldrain_url = ""
+          result_url = ""
           final_sent = False
 
           try:
               if not JOB_ID or not POST_ID or not GDRIVE_ID:
                   raise RuntimeError("Queue job ID, WordPress post ID, or Google Drive file ID is missing.")
-              if PLATFORM != "pixeldrain":
+              if PLATFORM not in ("pixeldrain", "gofile"):
                   raise RuntimeError(f"Unsupported upload platform: {PLATFORM}")
-              if not PIXELDRAIN_API:
+              if PLATFORM == "pixeldrain" and not PIXELDRAIN_API:
                   raise RuntimeError("Pixeldrain API key is missing. Configure it in WordPress > Files > Settings.")
+              if PLATFORM == "gofile" and not GOFILE_API_TOKEN:
+                  raise RuntimeError("GitHub Actions secret GOFILE_API_TOKEN is missing. Save the Gofile token in WordPress > Files > Settings and verify that GitHub Secrets permission is enabled.")
 
               download_dir = os.path.abspath("downloads")
               os.makedirs(download_dir, exist_ok=True)
@@ -222,7 +205,6 @@ jobs:
 
               update_progress("downloading", "Downloading the source file from Google Drive.")
               print(f"::notice title=Queue Job::Job #{JOB_ID} | Post #{POST_ID} | Platform: {PLATFORM}")
-
               drive_url = f"https://drive.google.com/uc?id={GDRIVE_ID}"
               downloaded_path = gdown.download(drive_url, quiet=False)
               if not downloaded_path or not os.path.isfile(downloaded_path):
@@ -232,63 +214,104 @@ jobs:
               file_name = os.path.basename(file_path)
               if not file_name:
                   raise RuntimeError("Google Drive returned an empty filename.")
-
               file_size = os.path.getsize(file_path)
               if file_size <= 0:
                   raise RuntimeError("Downloaded file is empty. Upload cancelled.")
-
               file_size_gb = round(file_size / (1024 ** 3), 3)
-              print(f"::notice title=Downloaded::{file_name} | {file_size_gb} GB")
-              update_progress("checking_duplicate", "Checking Pixeldrain for an exact filename match.", file_name)
+              print(f"::notice title=Downloaded::{file_name} | {file_size_gb} GiB")
 
-              wordpress_duplicate_url = find_wordpress_duplicate(file_name)
-              if wordpress_duplicate_url:
-                  pixeldrain_url = wordpress_duplicate_url
-                  message = "Skipped upload: WordPress found a live Pixeldrain file with this exact filename in its historical upload index. Reusing its existing link."
-                  print(f"::notice title=Duplicate Skipped::{file_name} already exists in the WordPress Pixeldrain index")
+              update_progress("checking_duplicate", f"Checking {PLATFORM} for an exact filename match.", file_name)
+              existing_url = find_wordpress_duplicate(file_name)
+              if existing_url:
+                  result_url = existing_url
+                  message = f"Skipped upload: this exact filename already has a successful {PLATFORM} link in CLOBD upload history. Reusing its saved link."
+                  print(f"::notice title=Duplicate Skipped::{file_name} already exists in CLOBD {PLATFORM} history")
                   update_progress("finishing", message, file_name)
-                  send_final_result("skipped_duplicate", file_name, pixeldrain_url, message)
+                  send_final_result("skipped_duplicate", file_name, result_url, message)
                   final_sent = True
                   sys.exit(0)
 
-              existing_id, existing_url = find_exact_duplicate(file_name)
-              if existing_id:
-                  pixeldrain_url = existing_url
-                  message = "Skipped upload: a file with this exact filename already exists in the Pixeldrain account. Reusing its existing link."
-                  print(f"::notice title=Duplicate Skipped::{file_name} already exists as {existing_id}")
-                  update_progress("finishing", message, file_name)
-                  send_final_result("skipped_duplicate", file_name, pixeldrain_url, message)
-                  final_sent = True
-                  sys.exit(0)
+              if PLATFORM == "pixeldrain":
+                  existing_id, existing_url = find_exact_pixeldrain_duplicate(file_name)
+                  if existing_id:
+                      result_url = existing_url
+                      message = "Skipped upload: a file with this exact filename already exists in the Pixeldrain account. Reusing its existing link."
+                      print(f"::notice title=Duplicate Skipped::{file_name} already exists as {existing_id}")
+                      update_progress("finishing", message, file_name)
+                      send_final_result("skipped_duplicate", file_name, result_url, message)
+                      final_sent = True
+                      sys.exit(0)
 
-              update_progress("uploading", f"Uploading {file_name} ({file_size_gb} GB) to Pixeldrain.", file_name)
-              encoded_name = quote(file_name, safe="")
-              upload_url = f"https://pixeldrain.com/api/file/{encoded_name}"
+                  update_progress("uploading", f"Uploading {file_name} ({file_size_gb} GiB) to Pixeldrain.", file_name)
+                  encoded_name = quote(file_name, safe="")
+                  upload_url = f"https://pixeldrain.com/api/file/{encoded_name}"
+                  with open(file_path, "rb") as file_handle:
+                      upload_response = requests.put(
+                          upload_url,
+                          auth=("", PIXELDRAIN_API),
+                          data=file_handle,
+                          headers=HEADERS,
+                          timeout=(30, 7200),
+                      )
+                  try:
+                      upload_data = upload_response.json()
+                  except ValueError:
+                      upload_data = {}
+                  if upload_response.status_code not in (200, 201) or not upload_data.get("id"):
+                      details = upload_response.text[:1000] if upload_response.text else "No response body"
+                      raise RuntimeError(f"Pixeldrain upload failed (HTTP {upload_response.status_code}): {details}")
+                  file_id = str(upload_data["id"]).strip()
+                  result_url = f"https://pixeldrain.com/u/{quote(file_id, safe='')}"
+                  message = f"Pixeldrain upload completed successfully. File size: {file_size_gb} GiB."
 
-              with open(file_path, "rb") as file_handle:
-                  upload_response = requests.put(
-                      upload_url,
-                      auth=("", PIXELDRAIN_API),
-                      data=file_handle,
-                      headers=HEADERS,
-                      timeout=(30, 7200),
-                  )
+              else:
+                  # Gofile content-list/search API access is Premium-only. To avoid an
+                  # unsafe partial account scan, duplicate protection here uses the
+                  # exact filename history managed by this WordPress queue.
+                  update_progress("uploading", f"Streaming {file_name} ({file_size_gb} GiB) to Gofile.", file_name)
+                  from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
 
-              try:
-                  upload_data = upload_response.json()
-              except ValueError:
-                  upload_data = {}
+                  last_progress_bytes = [0]
+                  last_progress_time = [0.0]
+                  with open(file_path, "rb") as file_handle:
+                      encoder = MultipartEncoder(fields={
+                          "file": (file_name, file_handle, "application/octet-stream"),
+                      })
+                      def report_gofile_progress(monitor):
+                          now = time.time()
+                          if (monitor.bytes_read - last_progress_bytes[0] >= 32 * 1024 * 1024) or (now - last_progress_time[0] >= 30):
+                              last_progress_bytes[0] = monitor.bytes_read
+                              last_progress_time[0] = now
+                              percent = min(99, int((monitor.bytes_read / max(1, monitor.len)) * 100))
+                              update_progress("uploading", f"Uploading {file_name} to Gofile ({percent}% sent).", file_name)
+                      monitor = MultipartEncoderMonitor(encoder, report_gofile_progress)
+                      gofile_headers = dict(HEADERS)
+                      gofile_headers["Authorization"] = f"Bearer {GOFILE_API_TOKEN}"
+                      gofile_headers["Content-Type"] = monitor.content_type
+                      upload_response = requests.post(
+                          "https://upload.gofile.io/uploadfile",
+                          data=monitor,
+                          headers=gofile_headers,
+                          timeout=(30, 7200),
+                      )
+                  try:
+                      upload_data = upload_response.json()
+                  except ValueError as error:
+                      raise RuntimeError(f"Gofile returned invalid JSON (HTTP {upload_response.status_code}): {upload_response.text[:1000]}") from error
+                  if upload_response.status_code not in (200, 201) or not isinstance(upload_data, dict) or upload_data.get("status") != "ok":
+                      error_status = upload_data.get("status") if isinstance(upload_data, dict) else "unknown"
+                      raise RuntimeError(f"Gofile upload failed (HTTP {upload_response.status_code}, status {error_status}): {upload_response.text[:1200]}")
+                  data = upload_data.get("data") if isinstance(upload_data.get("data"), dict) else {}
+                  result_url = str(data.get("downloadPage") or "").strip()
+                  if not result_url and data.get("code"):
+                      result_url = f"https://gofile.io/d/{data['code']}"
+                  if not result_url.startswith("https://gofile.io/"):
+                      raise RuntimeError("Gofile reported success but did not return a valid public downloadPage URL.")
+                  message = f"Gofile upload completed successfully. File size: {file_size_gb} GiB."
 
-              if upload_response.status_code not in (200, 201) or not upload_data.get("id"):
-                  details = upload_response.text[:1000] if upload_response.text else "No response body"
-                  raise RuntimeError(f"Pixeldrain upload failed (HTTP {upload_response.status_code}): {details}")
-
-              file_id = str(upload_data["id"]).strip()
-              pixeldrain_url = f"https://pixeldrain.com/u/{quote(file_id, safe='')}"
-              message = f"Upload completed successfully. File size: {file_size_gb} GB."
-              print(f"::notice title=Pixeldrain Upload Complete::{pixeldrain_url}")
-              update_progress("finishing", "Upload completed; saving the Pixeldrain URL to WordPress.", file_name)
-              send_final_result("completed", file_name, pixeldrain_url, message)
+              print(f"::notice title={PLATFORM.title()} Upload Complete::{result_url}")
+              update_progress("finishing", f"Upload completed; saving the {PLATFORM} URL to WordPress.", file_name)
+              send_final_result("completed", file_name, result_url, message)
               final_sent = True
 
           except SystemExit:
@@ -297,7 +320,6 @@ jobs:
               error_message = str(error) or error.__class__.__name__
               print(f"::error title=Upload Job Failed::{error_message}")
               traceback.print_exc()
-
               if not final_sent:
                   try:
                       update_progress("finishing", "Job failed; reporting the error to WordPress.", file_name)
@@ -305,7 +327,6 @@ jobs:
                       final_sent = True
                   except Exception as callback_error:
                       print(f"::error title=WordPress Failure Callback::{callback_error}")
-
               sys.exit(1)
 
       # Covers failures before the upload script starts (checkout, pip install,
@@ -319,6 +340,7 @@ jobs:
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
           JOB_ID: ${{ github.event.client_payload.job_id }}
           POST_ID: ${{ github.event.client_payload.post_id }}
+          PLATFORM: ${{ github.event.client_payload.platform }}
           JOB_STATUS: ${{ job.status }}
           GH_RUN_ID: ${{ github.run_id }}
         run: |
@@ -334,6 +356,7 @@ jobs:
               "webhook_secret": os.environ.get("WEBHOOK_SECRET", ""),
               "job_id": os.environ.get("JOB_ID", ""),
               "post_id": os.environ.get("POST_ID", ""),
+              "platform": os.environ.get("PLATFORM", "pixeldrain"),
               "result_status": result_status,
               "message": f"GitHub Actions ended with job status: {status}. This fallback callback was sent so the queue can continue.",
           }
