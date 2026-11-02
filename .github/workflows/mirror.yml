@@ -85,6 +85,7 @@ jobs:
           GOFILE_API_TOKEN: ${{ github.event.client_payload.platform == 'gofile' && secrets.GOFILE_API_TOKEN || '' }}
           BUZZHEAVIER_ACCOUNT_ID: ${{ github.event.client_payload.platform == 'buzzheavier' && secrets.BUZZHEAVIER_ACCOUNT_ID || '' }}
           GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           import os
           import sys
@@ -113,6 +114,10 @@ jobs:
           GOFILE_API_TOKEN = os.environ.get("GOFILE_API_TOKEN", "").strip()
           BUZZHEAVIER_ACCOUNT_ID = os.environ.get("BUZZHEAVIER_ACCOUNT_ID", "").strip()
           RUN_ID = os.environ.get("GH_RUN_ID", "").strip()
+          try:
+              RUN_ATTEMPT = max(1, int(os.environ.get("GH_RUN_ATTEMPT", "1").strip() or "1"))
+          except (TypeError, ValueError):
+              RUN_ATTEMPT = 1
 
           HEADERS = {
               "User-Agent": "CLOBD-GitHub-Actions-Multi-Cloud-Queue/1.0",
@@ -446,10 +451,20 @@ jobs:
                       if existing_name == buzz_upload_name:
                           existing_account_file = (existing_id, existing_item)
                           break
-                  if existing_account_file and not FORCE_UPLOAD:
+                  # A GitHub Actions "Re-run jobs" attempt can replay an upload
+                  # that already reached BUZZHEAVIER but whose callback/parser
+                  # failed afterward. Reuse that exact account file on reruns,
+                  # even when the original job was dispatched as a forced upload.
+                  # A fresh run (run_attempt == 1) still respects explicit force
+                  # re-upload requests from the WordPress Cloud Monitor.
+                  is_github_workflow_rerun = RUN_ATTEMPT > 1
+                  if existing_account_file and (not FORCE_UPLOAD or is_github_workflow_rerun):
                       buzz_file_id = existing_account_file[0]
                       result_url = f"https://buzzheavier.com/{quote(buzz_file_id, safe='')}"
-                      message = "Skipped upload: this exact filename already exists in your authenticated BUZZHEAVIER account root. Reusing its existing link."
+                      if is_github_workflow_rerun and FORCE_UPLOAD:
+                          message = "Skipped duplicate upload on GitHub workflow rerun: this exact filename already exists in your authenticated BUZZHEAVIER account root. Reusing its existing link."
+                      else:
+                          message = "Skipped upload: this exact filename already exists in your authenticated BUZZHEAVIER account root. Reusing its existing link."
                       print(f"::notice title=BUZZHEAVIER Duplicate::{file_name} already exists in account root as {buzz_file_id}")
                       update_progress("finishing", message, file_name)
                       send_final_result("skipped_duplicate", file_name, result_url, message)
@@ -624,11 +639,51 @@ jobs:
                       response_code = upload_data.get("code") if isinstance(upload_data, dict) else None
                       response_data = upload_data.get("data") if isinstance(upload_data, dict) else None
                       buzz_file_id = str(response_data.get("id", "")).strip() if isinstance(response_data, dict) else ""
-                      if (response_code is not None and str(response_code) != "200") or not buzz_file_id:
+
+                      # BUZZHEAVIER's account-upload endpoint returns HTTP 201
+                      # with JSON code=201 when a new file is CREATED. The
+                      # previous parser accepted only code=200, so it marked a
+                      # real successful upload as failed after the server had
+                      # already stored the file. Accept both documented/common
+                      # success codes, while still requiring a returned file ID.
+                      accepted_response_codes = {"200", "201"}
+                      if response_code is not None and str(response_code) not in accepted_response_codes:
                           raise RuntimeError(
-                              "BUZZHEAVIER account upload returned an unexpected success response: "
+                              "BUZZHEAVIER account upload returned an unsuccessful API response: "
                               f"{curl_response_text[:1200]}"
                           )
+                      if not buzz_file_id:
+                          raise RuntimeError(
+                              "BUZZHEAVIER returned HTTP success but did not include data.id; "
+                              f"response: {curl_response_text[:1200]}"
+                          )
+
+                      returned_name = str(response_data.get("name", "")).strip() if isinstance(response_data, dict) else ""
+                      if returned_name and returned_name != buzz_upload_name:
+                          raise RuntimeError(
+                              "BUZZHEAVIER accepted the upload but returned an unexpected filename. "
+                              f"Expected '{buzz_upload_name}', received '{returned_name}'."
+                          )
+                      returned_size = response_data.get("size") if isinstance(response_data, dict) else None
+                      if returned_size is not None:
+                          try:
+                              if int(returned_size) != int(os.path.getsize(file_path)):
+                                  raise RuntimeError(
+                                      "BUZZHEAVIER returned a file size that does not match the uploaded source: "
+                                      f"expected {os.path.getsize(file_path)} bytes, received {returned_size} bytes."
+                                  )
+                          except (TypeError, ValueError):
+                              print("::warning title=BUZZHEAVIER Response::Could not parse returned file size; file ID was present and API success code was accepted.")
+                      returned_location_id = str(response_data.get("locationId", "")).strip() if isinstance(response_data, dict) else ""
+                      if returned_location_id and returned_location_id != location_id:
+                          print(
+                              f"::warning title=BUZZHEAVIER Region::Requested location {location_id}, "
+                              f"but API response reports {returned_location_id}. Check the file in BUZZHEAVIER File Manager."
+                          )
+                      print(
+                          f"::notice title=BUZZHEAVIER Upload Accepted::API code {response_code or curl_http_status}; "
+                          f"file ID {buzz_file_id}; remote name {returned_name or buzz_upload_name}."
+                      )
                   finally:
                       for temporary_path in (curl_config_path, curl_response_path):
                           if temporary_path:
