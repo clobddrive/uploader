@@ -80,9 +80,10 @@ jobs:
           PROGRESS_URL: ${{ github.event.client_payload.progress_url }}
           DUPLICATE_CHECK_URL: ${{ github.event.client_payload.duplicate_check_url }}
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
-          PIXELDRAIN_API: ${{ github.event.client_payload.pixeldrain_api }}
+          PROVIDER_CONFIG: ${{ github.event.client_payload.provider_config || github.event.client_payload.pixeldrain_api || '' }}
           FORCE_UPLOAD: ${{ github.event.client_payload.force_upload || 'no' }}
           GOFILE_API_TOKEN: ${{ github.event.client_payload.platform == 'gofile' && secrets.GOFILE_API_TOKEN || '' }}
+          BUZZHEAVIER_ACCOUNT_ID: ${{ github.event.client_payload.platform == 'buzzheavier' && secrets.BUZZHEAVIER_ACCOUNT_ID || '' }}
           GH_RUN_ID: ${{ github.run_id }}
         run: |
           import os
@@ -101,9 +102,12 @@ jobs:
           PROGRESS_URL = os.environ.get("PROGRESS_URL", "").strip()
           DUPLICATE_CHECK_URL = os.environ.get("DUPLICATE_CHECK_URL", "").strip()
           WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
-          PIXELDRAIN_API = os.environ.get("PIXELDRAIN_API", "").strip()
+          PROVIDER_CONFIG = os.environ.get("PROVIDER_CONFIG", "").strip()
+          PIXELDRAIN_API = PROVIDER_CONFIG if PLATFORM == "pixeldrain" else ""
+          BUZZHEAVIER_REGION = PROVIDER_CONFIG if PLATFORM == "buzzheavier" and PROVIDER_CONFIG else "Asia-Pacific"
           FORCE_UPLOAD = os.environ.get("FORCE_UPLOAD", "no").strip().lower() == "yes"
           GOFILE_API_TOKEN = os.environ.get("GOFILE_API_TOKEN", "").strip()
+          BUZZHEAVIER_ACCOUNT_ID = os.environ.get("BUZZHEAVIER_ACCOUNT_ID", "").strip()
           RUN_ID = os.environ.get("GH_RUN_ID", "").strip()
 
           HEADERS = {
@@ -139,8 +143,9 @@ jobs:
                   "file_name": file_name,
                   "result_url": result_url,
                   "pixeldrain_url": result_url if PLATFORM == "pixeldrain" else "",
-                  "gofile_url": result_url if PLATFORM == "gofile" else "",
-                  "result_status": result_status,
+                  'gofile_url': result_url if PLATFORM == "gofile" else "",
+                  'buzzheavier_url': result_url if PLATFORM == "buzzheavier" else "",
+                  'result_status': result_status,
                   "message": message,
               }
               response = requests.post(CALLBACK_URL, json=payload, headers=HEADERS, timeout=45)
@@ -165,7 +170,7 @@ jobs:
               if not isinstance(data, dict) or data.get("success") is not True:
                   raise RuntimeError("WordPress duplicate-check endpoint did not return a valid result.")
               if data.get("duplicate"):
-                  return str(data.get("result_url") or data.get("pixeldrain_url") or data.get("gofile_url") or "").strip()
+                  return str(data.get("result_url") or data.get("pixeldrain_url") or data.get("gofile_url") or data.get("buzzheavier_url") or "").strip()
               return ""
 
           def find_exact_pixeldrain_duplicate(file_name):
@@ -197,12 +202,14 @@ jobs:
           try:
               if not JOB_ID or not POST_ID or not GDRIVE_ID:
                   raise RuntimeError("Queue job ID, WordPress post ID, or Google Drive file ID is missing.")
-              if PLATFORM not in ("pixeldrain", "gofile"):
+              if PLATFORM not in ("pixeldrain", "gofile", "buzzheavier"):
                   raise RuntimeError(f"Unsupported upload platform: {PLATFORM}")
               if PLATFORM == "pixeldrain" and not PIXELDRAIN_API:
                   raise RuntimeError("Pixeldrain API key is missing. Configure it in WordPress > Files > Settings.")
               if PLATFORM == "gofile" and not GOFILE_API_TOKEN:
                   raise RuntimeError("GitHub Actions secret GOFILE_API_TOKEN is missing. Save the Gofile token in WordPress > Files > Settings and verify that GitHub Secrets permission is enabled.")
+              if PLATFORM == "buzzheavier" and not BUZZHEAVIER_ACCOUNT_ID:
+                  raise RuntimeError("GitHub Actions secret BUZZHEAVIER_ACCOUNT_ID is missing. Enter your BUZZHEAVIER Account ID in WordPress > Files > Settings and validate/sync it.")
 
               download_dir = os.path.abspath("downloads")
               os.makedirs(download_dir, exist_ok=True)
@@ -269,7 +276,7 @@ jobs:
                   result_url = f"https://pixeldrain.com/u/{quote(file_id, safe='')}"
                   message = f"Pixeldrain upload completed successfully. File size: {file_size_gb} GiB."
 
-              else:
+              elif PLATFORM == "gofile":
                   # Gofile content-list/search API access is Premium-only. To avoid an
                   # unsafe partial account scan, duplicate protection here uses the
                   # exact filename history managed by this WordPress queue.
@@ -313,6 +320,195 @@ jobs:
                   if not result_url.startswith("https://gofile.io/"):
                       raise RuntimeError("Gofile reported success but did not return a valid public downloadPage URL.")
                   message = f"Gofile upload completed successfully. File size: {file_size_gb} GiB."
+
+              else:
+                  # Authenticated account upload. The Account ID is injected only
+                  # from the encrypted GitHub Actions secret (never client_payload).
+                  allowed_regions = {
+                      "Asia-Pacific", "Western Europe", "Eastern Europe",
+                      "Central Europe", "Eastern US", "Western US",
+                  }
+                  if BUZZHEAVIER_REGION not in allowed_regions:
+                      raise RuntimeError(f"Unsupported BUZZHEAVIER storage region: {BUZZHEAVIER_REGION}")
+                  if not BUZZHEAVIER_ACCOUNT_ID:
+                      raise RuntimeError("BUZZHEAVIER_ACCOUNT_ID GitHub Actions secret is missing.")
+                  if len(file_name) > 500:
+                      raise RuntimeError(f"BUZZHEAVIER filename exceeds the API's 500-character limit: {len(file_name)}")
+
+                  buzz_auth_headers = dict(HEADERS)
+                  buzz_auth_headers["Authorization"] = f"Bearer {BUZZHEAVIER_ACCOUNT_ID}"
+
+                  # Get the authenticated root directory. API docs specify that
+                  # account uploads must target a parent directory ID.
+                  update_progress("checking_account", "Authenticating with BUZZHEAVIER and resolving the account root directory.", file_name)
+                  root_response = requests.get(
+                      "https://buzzheavier.com/api/fs",
+                      headers=buzz_auth_headers,
+                      timeout=(20, 90),
+                  )
+                  if root_response.status_code != 200:
+                      raise RuntimeError(f"BUZZHEAVIER File Manager authentication/root lookup failed (HTTP {root_response.status_code}): {root_response.text[:700]}")
+                  try:
+                      root_payload = root_response.json()
+                  except ValueError as error:
+                      raise RuntimeError("BUZZHEAVIER File Manager returned invalid JSON for the root directory.") from error
+                  if not isinstance(root_payload, dict):
+                      raise RuntimeError("BUZZHEAVIER File Manager returned an unexpected root-directory response.")
+
+                  def _is_scalar_id(value):
+                      return isinstance(value, (str, int)) and str(value).strip() != ""
+
+                  def _find_root_directory_id(payload):
+                      # Prefer explicit root/parent identifiers wherever the API
+                      # nests its root metadata, then use the id of the root node.
+                      preferred = ("rootId", "rootDirectoryId", "directoryId", "parentId", "folderId", "root_id", "parent_id")
+                      containers = []
+                      def collect_containers(value, depth=0):
+                          if depth > 8:
+                              return
+                          if isinstance(value, dict):
+                              containers.append(value)
+                              for child in value.values():
+                                  if isinstance(child, (dict, list)):
+                                      collect_containers(child, depth + 1)
+                          elif isinstance(value, list):
+                              for child in value:
+                                  if isinstance(child, (dict, list)):
+                                      collect_containers(child, depth + 1)
+                      collect_containers(payload)
+                      for container in containers:
+                          for key in preferred:
+                              value = container.get(key)
+                              if _is_scalar_id(value):
+                                  return str(value).strip()
+                      # Root nodes generally expose their own id plus contents;
+                      # also accept explicit root/current-directory wrappers.
+                      for container in containers:
+                          has_contents = any(k in container for k in ("files", "folders", "directories", "items", "children", "contents"))
+                          is_root_wrapper = any(k in container for k in ("root", "rootDirectory", "currentDirectory", "directory"))
+                          if has_contents or is_root_wrapper:
+                              for key in ("id", "_id"):
+                                  value = container.get(key)
+                                  if _is_scalar_id(value):
+                                      return str(value).strip()
+                      return ""
+
+                  root_directory_id = _find_root_directory_id(root_payload)
+                  if not root_directory_id:
+                      top_keys = ", ".join(str(k) for k in list(root_payload.keys())[:20])
+                      raise RuntimeError("BUZZHEAVIER authenticated root response did not expose a root directory ID; upload stopped safely. Root response keys: " + (top_keys or "none"))
+
+                  # Find an exact filename match inside the same account root.
+                  # This protects against duplicates created outside CLOBD too.
+                  def _walk_named_items(value, depth=0):
+                      if depth > 8:
+                          return
+                      if isinstance(value, dict):
+                          name = value.get("name") or value.get("filename")
+                          item_id = value.get("id") or value.get("fileId") or value.get("file_id")
+                          item_type = str(value.get("type") or value.get("kind") or "").strip().casefold()
+                          is_directory = (value.get("isDirectory") is True) or (value.get("is_dir") is True) or item_type in ("directory", "folder", "dir")
+                          if isinstance(name, str) and _is_scalar_id(item_id) and not is_directory:
+                              yield name, str(item_id).strip(), value
+                          for key in ("data", "files", "folders", "directories", "items", "children", "contents", "result"):
+                              if key in value:
+                                  yield from _walk_named_items(value[key], depth + 1)
+                      elif isinstance(value, list):
+                          for item in value:
+                              yield from _walk_named_items(item, depth + 1)
+
+                  existing_account_file = None
+                  for existing_name, existing_id, existing_item in _walk_named_items(root_payload):
+                      if existing_name == file_name:
+                          existing_account_file = (existing_id, existing_item)
+                          break
+                  if existing_account_file and not FORCE_UPLOAD:
+                      buzz_file_id = existing_account_file[0]
+                      result_url = f"https://buzzheavier.com/{quote(buzz_file_id, safe='')}"
+                      message = "Skipped upload: this exact filename already exists in your authenticated BUZZHEAVIER account root. Reusing its existing link."
+                      print(f"::notice title=BUZZHEAVIER Duplicate::{file_name} already exists in account root as {buzz_file_id}")
+                      update_progress("finishing", message, file_name)
+                      send_final_result("skipped_duplicate", file_name, result_url, message)
+                      final_sent = True
+                      sys.exit(0)
+
+                  # Resolve current region ID. The documented account-directory
+                  # upload route is /{parentId}/{name}; locationId is appended
+                  # to that authenticated route so Asia-Pacific can be requested.
+                  update_progress("uploading", f"Resolving BUZZHEAVIER {BUZZHEAVIER_REGION} storage location.", file_name)
+                  locations_response = requests.get(
+                      "https://buzzheavier.com/api/locations",
+                      headers=HEADERS,
+                      timeout=(20, 60),
+                  )
+                  locations_response.raise_for_status()
+                  try:
+                      locations_data = locations_response.json()
+                  except ValueError as error:
+                      raise RuntimeError("BUZZHEAVIER locations API returned invalid JSON.") from error
+                  location_rows = locations_data.get("data") if isinstance(locations_data, dict) else None
+                  if not isinstance(location_rows, list):
+                      raise RuntimeError("BUZZHEAVIER locations API did not return a valid data array.")
+                  location_id = ""
+                  for location in location_rows:
+                      if isinstance(location, dict) and str(location.get("name", "")).strip().casefold() == BUZZHEAVIER_REGION.casefold():
+                          location_id = str(location.get("id", "")).strip()
+                          break
+                  if not location_id:
+                      available = ", ".join(str(x.get("name", "")) for x in location_rows if isinstance(x, dict))
+                      raise RuntimeError(f"BUZZHEAVIER region '{BUZZHEAVIER_REGION}' was not returned by the locations API. Available: {available or 'none'}")
+
+                  from urllib.parse import urlencode
+                  encoded_name = quote(file_name, safe="")
+                  query = urlencode({"locationId": location_id})
+                  upload_url = f"https://w.buzzheavier.com/{quote(root_directory_id, safe='')}/{encoded_name}?{query}"
+                  update_progress("uploading", f"Uploading {file_name} ({file_size_gb} GiB) into your BUZZHEAVIER account · {BUZZHEAVIER_REGION}.", file_name)
+
+                  class ProgressStream:
+                      def __init__(self, stream, total_size):
+                          self.stream = stream
+                          self.total_size = int(total_size)
+                          self.sent = 0
+                          self.last_reported = 0
+                          self.last_report_time = time.time()
+                      def __len__(self):
+                          return self.total_size
+                      def __iter__(self):
+                          while True:
+                              chunk = self.stream.read(8 * 1024 * 1024)
+                              if not chunk:
+                                  break
+                              self.sent += len(chunk)
+                              now = time.time()
+                              if (self.sent - self.last_reported >= 64 * 1024 * 1024) or (now - self.last_report_time >= 30):
+                                  self.last_reported = self.sent
+                                  self.last_report_time = now
+                                  percent = min(99, int((self.sent / max(1, self.total_size)) * 100))
+                                  update_progress("uploading", f"Uploading {file_name} into BUZZHEAVIER account ({percent}% sent · {BUZZHEAVIER_REGION}).", file_name)
+                              yield chunk
+
+                  buzz_upload_headers = dict(buzz_auth_headers)
+                  buzz_upload_headers["Content-Type"] = "application/octet-stream"
+                  with open(file_path, "rb") as file_handle:
+                      stream = ProgressStream(file_handle, file_size)
+                      upload_response = requests.put(
+                          upload_url,
+                          data=stream,
+                          headers=buzz_upload_headers,
+                          timeout=(30, 7200),
+                      )
+                  try:
+                      upload_data = upload_response.json()
+                  except ValueError as error:
+                      raise RuntimeError(f"BUZZHEAVIER returned invalid JSON (HTTP {upload_response.status_code}): {upload_response.text[:1000]}") from error
+                  response_code = upload_data.get("code") if isinstance(upload_data, dict) else None
+                  response_data = upload_data.get("data") if isinstance(upload_data, dict) else None
+                  buzz_file_id = str(response_data.get("id", "")).strip() if isinstance(response_data, dict) else ""
+                  if upload_response.status_code not in (200, 201) or (response_code is not None and str(response_code) != "200") or not buzz_file_id:
+                      details = upload_response.text[:1200] if upload_response.text else "No response body"
+                      raise RuntimeError(f"Authenticated BUZZHEAVIER account upload failed (HTTP {upload_response.status_code}): {details}")
+                  result_url = f"https://buzzheavier.com/{quote(buzz_file_id, safe='')}"
+                  message = f"BUZZHEAVIER authenticated account upload completed in {BUZZHEAVIER_REGION}. File size: {file_size_gb} GiB."
 
               print(f"::notice title={PLATFORM.title()} Upload Complete::{result_url}")
               update_progress("finishing", f"Upload completed; saving the {PLATFORM} URL to WordPress.", file_name)
