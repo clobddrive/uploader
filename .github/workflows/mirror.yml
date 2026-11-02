@@ -97,7 +97,8 @@ jobs:
           import re
           import subprocess
           import tempfile
-          from urllib.parse import quote
+          from urllib.parse import quote, unquote
+          from email.message import Message
 
           JOB_ID = os.environ.get("JOB_ID", "").strip()
           PLATFORM = os.environ.get("PLATFORM", "pixeldrain").strip().lower()
@@ -182,6 +183,139 @@ jobs:
                   return str(data.get("result_url") or data.get("pixeldrain_url") or data.get("gofile_url") or data.get("buzzheavier_url") or "").strip()
               return ""
 
+          def request_google_cloud_fast_fallback():
+              """Ask the authenticated WordPress queue endpoint for this post's Google Cloud (Fast) URL."""
+              if not DUPLICATE_CHECK_URL or not WEBHOOK_SECRET or not POST_ID:
+                  raise RuntimeError("Google Drive quota was exceeded, but the WordPress fallback lookup is not configured (missing endpoint, webhook secret, or post ID).")
+              payload = {
+                  "action": "get_google_cloud_fast_fallback",
+                  "webhook_secret": WEBHOOK_SECRET,
+                  "post_id": POST_ID,
+              }
+              response = requests.post(
+                  DUPLICATE_CHECK_URL,
+                  json=payload,
+                  headers=HEADERS,
+                  timeout=(20, 60),
+              )
+              if response.status_code != 200:
+                  detail = response.text[:700] if response.text else "No response body"
+                  raise RuntimeError(f"WordPress could not return the Google Cloud (Fast) fallback URL (HTTP {response.status_code}): {detail}")
+              try:
+                  data = response.json()
+              except ValueError as error:
+                  raise RuntimeError("WordPress returned invalid JSON while looking up the Google Cloud (Fast) fallback URL.") from error
+              if not isinstance(data, dict) or not data.get("success") or not data.get("fallback_available"):
+                  detail = str(data.get("error") or "No Google Cloud (Fast) link is saved in this File post.") if isinstance(data, dict) else "Unexpected WordPress response."
+                  raise RuntimeError(f"Google Drive download quota was exceeded, and the File post has no usable Google Cloud (Fast) fallback: {detail}")
+              fallback_url = str(data.get("fallback_url") or "").strip()
+              from urllib.parse import urlparse
+              parsed = urlparse(fallback_url)
+              if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                  raise RuntimeError("WordPress returned an invalid Google Cloud (Fast) fallback URL. HTTPS is required.")
+              data["fallback_url"] = fallback_url
+              return data
+
+          def _filename_from_content_disposition(header_value):
+              if not header_value:
+                  return ""
+              message = Message()
+              message["content-disposition"] = header_value
+              value = message.get_filename()
+              return unquote(str(value)).strip() if value else ""
+
+          def _safe_local_filename(value):
+              value = str(value or "").replace("\\", "/").split("/")[-1]
+              value = re.sub(r"[\x00-\x1f\x7f]", "", value).strip()
+              if value in ("", ".", ".."):
+                  return ""
+              return value
+
+          def download_from_google_cloud_fast(fallback_info, download_dir):
+              """Stream the saved Cloudflare Worker URL to disk without buffering the file in RAM."""
+              fallback_url = fallback_info["fallback_url"]
+              expected_name = _safe_local_filename(fallback_info.get("file_name"))
+              part_path = os.path.join(download_dir, f".clobd-fallback-{JOB_ID}.part")
+              total_written = 0
+              expected_content_length = 0
+              last_progress_time = 0.0
+              last_progress_bytes = 0
+              try:
+                  with requests.get(
+                      fallback_url,
+                      headers={"User-Agent": HEADERS["User-Agent"], "Accept": "*/*"},
+                      stream=True,
+                      allow_redirects=True,
+                      timeout=(30, 300),
+                  ) as response:
+                      if response.status_code != 200:
+                          raise RuntimeError(f"Google Cloud (Fast) download failed (HTTP {response.status_code}): {response.text[:500]}")
+                      from urllib.parse import urlparse
+                      if urlparse(response.url).scheme != "https":
+                          raise RuntimeError("Google Cloud (Fast) redirected to a non-HTTPS address. Download was blocked for security.")
+                      content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
+                      try:
+                          expected_content_length = int(response.headers.get("Content-Length", "0") or 0)
+                      except (TypeError, ValueError):
+                          expected_content_length = 0
+                      header_name = _safe_local_filename(_filename_from_content_disposition(response.headers.get("Content-Disposition", "")))
+                      file_name = expected_name or header_name
+                      if not file_name:
+                          raise RuntimeError("Google Cloud (Fast) did not provide a filename, and the WordPress File post has no usable source filename.")
+
+                      chunk_iterator = iter(response.iter_content(chunk_size=8 * 1024 * 1024))
+                      first_chunk = next(chunk_iterator, b"")
+                      preview = (first_chunk or b"").lstrip()[:160].lower()
+                      looks_like_error_document = preview.startswith((b"<!doctype html", b"<html", b"{\"error\"", b"{\n  \"error\"", b"{\"success\":false", b"[\"error\""))
+                      if content_type in ("text/html", "application/json") or looks_like_error_document:
+                          raise RuntimeError(f"Google Cloud (Fast) returned an HTML/JSON response instead of the file ({content_type or 'unknown content type'}). The signed Worker URL may have expired or returned an error page.")
+
+                      with open(part_path, "wb") as output:
+                          if first_chunk:
+                              output.write(first_chunk)
+                              total_written += len(first_chunk)
+                          for chunk in chunk_iterator:
+                              if not chunk:
+                                  continue
+                              output.write(chunk)
+                              total_written += len(chunk)
+                              now = time.time()
+                              if total_written - last_progress_bytes >= 64 * 1024 * 1024 or now - last_progress_time >= 30:
+                                  last_progress_bytes = total_written
+                                  last_progress_time = now
+                                  if expected_content_length > 0:
+                                      percent = min(99, int((total_written / expected_content_length) * 100))
+                                      message = f"Downloading from Google Cloud (Fast) ({percent}% · {total_written / (1024 ** 2):.0f} MiB)."
+                                  else:
+                                      message = f"Downloading from Google Cloud (Fast) ({total_written / (1024 ** 2):.0f} MiB received)."
+                                  update_progress("downloading_fallback", message, file_name)
+
+                  if total_written <= 0 or not os.path.isfile(part_path):
+                      raise RuntimeError("Google Cloud (Fast) returned an empty file. Upload cancelled.")
+                  if expected_content_length > 0 and total_written != expected_content_length:
+                      raise RuntimeError(f"Google Cloud (Fast) download was incomplete: expected {expected_content_length} bytes, received {total_written} bytes.")
+                  final_path = os.path.join(download_dir, file_name)
+                  os.replace(part_path, final_path)
+                  return final_path
+              except Exception:
+                  try:
+                      if os.path.exists(part_path):
+                          os.remove(part_path)
+                  except OSError:
+                      pass
+                  raise
+
+          def is_google_drive_quota_error(error_text):
+              text = str(error_text or "").casefold()
+              quota_markers = (
+                  "too many users have viewed or downloaded this file recently",
+                  "download quota exceeded",
+                  "download quota has been exceeded",
+                  "user rate limit exceeded",
+                  "too many users",
+              )
+              return any(marker in text for marker in quota_markers)
+
           def find_exact_pixeldrain_duplicate(file_name):
               """Return (file_id, url) for an exact-name match in the Pixeldrain API account."""
               response = requests.get(
@@ -227,7 +361,19 @@ jobs:
               update_progress("downloading", "Downloading the source file from Google Drive.")
               print(f"::notice title=Queue Job::Job #{JOB_ID} | Post #{POST_ID} | Platform: {PLATFORM}")
               drive_url = f"https://drive.google.com/uc?id={GDRIVE_ID}"
-              downloaded_path = gdown.download(drive_url, quiet=False)
+              downloaded_path = ""
+              try:
+                  downloaded_path = gdown.download(drive_url, quiet=False)
+              except Exception as gdrive_error:
+                  gdrive_error_text = str(gdrive_error)
+                  if not is_google_drive_quota_error(gdrive_error_text):
+                      raise
+                  print("::warning title=Google Drive Download Quota::Google Drive blocked this file because its recent download/view quota was exceeded. Trying the Google Cloud (Fast) link saved in the same CLOBD File post.")
+                  update_progress("downloading_fallback", "Google Drive download quota exceeded. Looking up the Google Cloud (Fast) fallback in this File post.")
+                  fallback_info = request_google_cloud_fast_fallback()
+                  print(f"::notice title=Download Fallback::Found Google Cloud (Fast) link in post #{POST_ID}; downloading the alternate source.")
+                  downloaded_path = download_from_google_cloud_fast(fallback_info, download_dir)
+                  print("::notice title=Download Fallback Complete::Google Cloud (Fast) download completed; continuing with the existing provider upload flow.")
               if not downloaded_path or not os.path.isfile(downloaded_path):
                   raise RuntimeError("Google Drive file could not be downloaded. Check access permissions and the source link.")
 
