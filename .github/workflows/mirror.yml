@@ -58,10 +58,10 @@ jobs:
           PY
 
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -92,6 +92,10 @@ jobs:
           import traceback
           import requests
           import gdown
+          import json
+          import re
+          import subprocess
+          import tempfile
           from urllib.parse import quote
 
           JOB_ID = os.environ.get("JOB_ID", "").strip()
@@ -464,49 +468,154 @@ jobs:
                   upload_url = f"https://w.buzzheavier.com/{quote(root_directory_id, safe='')}/{encoded_name}?{query}"
                   update_progress("uploading", f"Uploading {file_name} ({file_size_gb} GiB) into your BUZZHEAVIER account · {BUZZHEAVIER_REGION}.", file_name)
 
-                  class ProgressStream:
-                      def __init__(self, stream, total_size):
-                          self.stream = stream
-                          self.total_size = int(total_size)
-                          self.sent = 0
-                          self.last_reported = 0
-                          self.last_report_time = time.time()
-                      def __len__(self):
-                          return self.total_size
-                      def __iter__(self):
-                          while True:
-                              chunk = self.stream.read(8 * 1024 * 1024)
-                              if not chunk:
-                                  break
-                              self.sent += len(chunk)
-                              now = time.time()
-                              if (self.sent - self.last_reported >= 64 * 1024 * 1024) or (now - self.last_report_time >= 30):
-                                  self.last_reported = self.sent
-                                  self.last_report_time = now
-                                  percent = min(99, int((self.sent / max(1, self.total_size)) * 100))
-                                  update_progress("uploading", f"Uploading {file_name} into BUZZHEAVIER account ({percent}% sent · {BUZZHEAVIER_REGION}).", file_name)
-                              yield chunk
+                  # Use BUZZHEAVIER's documented cURL -T upload method rather
+                  # than requests.put() with a custom streaming iterator. This
+                  # avoids the requests/urllib3 TLS EOF failure seen on large
+                  # uploads and lets curl retry a dropped upload connection.
+                  update_progress("uploading", f"Uploading {file_name} ({file_size_gb} GiB) into your BUZZHEAVIER account · {BUZZHEAVIER_REGION}.", file_name)
 
-                  buzz_upload_headers = dict(buzz_auth_headers)
-                  buzz_upload_headers["Content-Type"] = "application/octet-stream"
-                  with open(file_path, "rb") as file_handle:
-                      stream = ProgressStream(file_handle, file_size)
-                      upload_response = requests.put(
-                          upload_url,
-                          data=stream,
-                          headers=buzz_upload_headers,
-                          timeout=(30, 7200),
-                      )
+                  curl_config_path = ""
+                  curl_response_path = ""
                   try:
-                      upload_data = upload_response.json()
-                  except ValueError as error:
-                      raise RuntimeError(f"BUZZHEAVIER returned invalid JSON (HTTP {upload_response.status_code}): {upload_response.text[:1000]}") from error
-                  response_code = upload_data.get("code") if isinstance(upload_data, dict) else None
-                  response_data = upload_data.get("data") if isinstance(upload_data, dict) else None
-                  buzz_file_id = str(response_data.get("id", "")).strip() if isinstance(response_data, dict) else ""
-                  if upload_response.status_code not in (200, 201) or (response_code is not None and str(response_code) != "200") or not buzz_file_id:
-                      details = upload_response.text[:1200] if upload_response.text else "No response body"
-                      raise RuntimeError(f"Authenticated BUZZHEAVIER account upload failed (HTTP {upload_response.status_code}): {details}")
+                      # Keep the Account ID out of the curl process arguments.
+                      config_fd, curl_config_path = tempfile.mkstemp(prefix="clobd-buzzheavier-", suffix=".curl")
+                      os.chmod(curl_config_path, 0o600)
+                      safe_account_id = BUZZHEAVIER_ACCOUNT_ID.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
+                      with os.fdopen(config_fd, "w", encoding="utf-8") as config_file:
+                          config_file.write(f'header = "Authorization: Bearer {safe_account_id}"\n')
+                          config_file.write('header = "Content-Type: application/octet-stream"\n')
+
+                      response_fd, curl_response_path = tempfile.mkstemp(prefix="clobd-buzzheavier-response-", suffix=".json")
+                      os.close(response_fd)
+
+                      curl_command = [
+                          "curl",
+                          "--http1.1",
+                          "--show-error",
+                          "--progress-bar",
+                          "--connect-timeout", "60",
+                          "--max-time", "0",
+                          "--keepalive-time", "30",
+                          "--retry", "4",
+                          "--retry-all-errors",
+                          "--retry-delay", "15",
+                          "--retry-max-time", "14400",
+                          "--upload-file", file_path,
+                          "--config", curl_config_path,
+                          "--output", curl_response_path,
+                          "--write-out", "\n%{http_code}",
+                          upload_url,
+                      ]
+
+                      print("::notice title=BUZZHEAVIER Transport::Using documented cURL upload with up to 4 automatic retries for interrupted connections.")
+                      curl_process = subprocess.Popen(
+                          curl_command,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          text=True,
+                          encoding="utf-8",
+                          errors="replace",
+                          bufsize=1,
+                      )
+
+                      curl_stderr_lines = []
+                      curl_line_buffer = ""
+                      last_curl_percent = [-5]
+
+                      def _handle_curl_progress_line(line):
+                          line = line.strip()
+                          if not line:
+                              return
+                          curl_stderr_lines.append(line)
+                          lowered = line.casefold()
+                          if "will retry" in lowered or "retrying" in lowered:
+                              update_progress(
+                                  "uploading",
+                                  f"BUZZHEAVIER connection was interrupted. cURL is retrying the upload from the beginning of the file ({BUZZHEAVIER_REGION}).",
+                                  file_name,
+                              )
+                          match = re.search(r"(?<!\d)(\d{1,3}(?:\.\d+)?)%", line)
+                          if match:
+                              percent = max(0, min(100, int(float(match.group(1)))))
+                              if percent >= last_curl_percent[0] + 5 or percent == 100:
+                                  last_curl_percent[0] = percent
+                                  update_progress(
+                                      "uploading",
+                                      f"Uploading {file_name} into BUZZHEAVIER account ({percent}% sent · {BUZZHEAVIER_REGION}).",
+                                      file_name,
+                                  )
+
+                      # Read cURL's carriage-return progress meter live so the
+                      # WordPress Cloud Monitor continues receiving progress.
+                      while True:
+                          character = curl_process.stderr.read(1)
+                          if character == "":
+                              break
+                          if character in ("\r", "\n"):
+                              _handle_curl_progress_line(curl_line_buffer)
+                              curl_line_buffer = ""
+                          else:
+                              curl_line_buffer += character
+                      if curl_line_buffer:
+                          _handle_curl_progress_line(curl_line_buffer)
+
+                      curl_stdout = curl_process.stdout.read() if curl_process.stdout else ""
+                      curl_return_code = curl_process.wait()
+                      curl_http_text = (curl_stdout or "").strip().splitlines()
+                      try:
+                          curl_http_status = int(curl_http_text[-1]) if curl_http_text else 0
+                      except (TypeError, ValueError):
+                          curl_http_status = 0
+
+                      try:
+                          with open(curl_response_path, "r", encoding="utf-8", errors="replace") as response_file:
+                              curl_response_text = response_file.read()
+                      except OSError:
+                          curl_response_text = ""
+
+                      if curl_return_code != 0:
+                          useful_curl_errors = [
+                              line for line in curl_stderr_lines
+                              if any(token in line.casefold() for token in ("curl:", "error", "retry", "failed", "ssl", "timed out"))
+                          ]
+                          curl_error_detail = "\n".join(useful_curl_errors[-12:])[-1600:]
+                          if not curl_error_detail:
+                              curl_error_detail = f"cURL exited with code {curl_return_code} without additional diagnostics."
+                          raise RuntimeError(
+                              "BUZZHEAVIER upload transport failed after automatic retries "
+                              f"(cURL exit {curl_return_code}). {curl_error_detail}"
+                          )
+
+                      if curl_http_status not in (200, 201):
+                          raise RuntimeError(
+                              f"Authenticated BUZZHEAVIER account upload failed (HTTP {curl_http_status}): "
+                              f"{curl_response_text[:1200] or 'No response body'}"
+                          )
+
+                      try:
+                          upload_data = json.loads(curl_response_text)
+                      except ValueError as error:
+                          raise RuntimeError(
+                              f"BUZZHEAVIER returned invalid JSON (HTTP {curl_http_status}): "
+                              f"{curl_response_text[:1000]}"
+                          ) from error
+
+                      response_code = upload_data.get("code") if isinstance(upload_data, dict) else None
+                      response_data = upload_data.get("data") if isinstance(upload_data, dict) else None
+                      buzz_file_id = str(response_data.get("id", "")).strip() if isinstance(response_data, dict) else ""
+                      if (response_code is not None and str(response_code) != "200") or not buzz_file_id:
+                          raise RuntimeError(
+                              "BUZZHEAVIER account upload returned an unexpected success response: "
+                              f"{curl_response_text[:1200]}"
+                          )
+                  finally:
+                      for temporary_path in (curl_config_path, curl_response_path):
+                          if temporary_path:
+                              try:
+                                  os.remove(temporary_path)
+                              except OSError:
+                                  pass
+
                   result_url = f"https://buzzheavier.com/{quote(buzz_file_id, safe='')}"
                   message = f"BUZZHEAVIER authenticated account upload completed in {BUZZHEAVIER_REGION}. File size: {file_size_gb} GiB."
 
