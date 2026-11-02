@@ -336,8 +336,28 @@ jobs:
                       raise RuntimeError(f"Unsupported BUZZHEAVIER storage region: {BUZZHEAVIER_REGION}")
                   if not BUZZHEAVIER_ACCOUNT_ID:
                       raise RuntimeError("BUZZHEAVIER_ACCOUNT_ID GitHub Actions secret is missing.")
-                  if len(file_name) > 500:
-                      raise RuntimeError(f"BUZZHEAVIER filename exceeds the API's 500-character limit: {len(file_name)}")
+
+                  # BUZZHEAVIER validates the filename parsed from the URL path.
+                  # CLOBD source names commonly use vertical bars as separators
+                  # (for example: "CLOBD.COM | Title | 1080p.mkv"). The API
+                  # responds with HTTP 400 "the Name field is invalid" for such
+                  # names. Keep the original filename for WordPress and other
+                  # providers; normalize only the remote BUZZHEAVIER filename.
+                  import unicodedata
+                  buzz_upload_name = unicodedata.normalize("NFC", file_name)
+                  buzz_upload_name = re.sub(r"[\x00-\x1f\x7f]", "", buzz_upload_name)
+                  # Replace path/filename-reserved characters with a hyphen.
+                  # Preserve Unicode letters, spaces, dots, parentheses and
+                  # ordinary punctuation used in movie titles.
+                  buzz_upload_name = re.sub(r'[<>:"/\\|?*]', "-", buzz_upload_name)
+                  buzz_upload_name = re.sub(r"\s+", " ", buzz_upload_name).strip(" .")
+                  buzz_upload_name = re.sub(r"-{2,}", "-", buzz_upload_name)
+                  if not buzz_upload_name or buzz_upload_name in (".", ".."):
+                      raise RuntimeError("BUZZHEAVIER filename became empty after removing unsupported filename characters.")
+                  if len(buzz_upload_name) > 500:
+                      raise RuntimeError(f"BUZZHEAVIER filename exceeds the API's 500-character limit after normalization: {len(buzz_upload_name)}")
+                  if buzz_upload_name != file_name:
+                      print(f"::notice title=BUZZHEAVIER Filename Normalized::Original CLOBD filename is preserved; BUZZHEAVIER remote filename will be: {buzz_upload_name}")
 
                   buzz_auth_headers = dict(HEADERS)
                   buzz_auth_headers["Authorization"] = f"Bearer {BUZZHEAVIER_ACCOUNT_ID}"
@@ -423,7 +443,7 @@ jobs:
 
                   existing_account_file = None
                   for existing_name, existing_id, existing_item in _walk_named_items(root_payload):
-                      if existing_name == file_name:
+                      if existing_name == buzz_upload_name:
                           existing_account_file = (existing_id, existing_item)
                           break
                   if existing_account_file and not FORCE_UPLOAD:
@@ -463,10 +483,11 @@ jobs:
                       raise RuntimeError(f"BUZZHEAVIER region '{BUZZHEAVIER_REGION}' was not returned by the locations API. Available: {available or 'none'}")
 
                   from urllib.parse import urlencode
-                  encoded_name = quote(file_name, safe="")
+                  encoded_name = quote(buzz_upload_name, safe="")
                   query = urlencode({"locationId": location_id})
                   upload_url = f"https://w.buzzheavier.com/{quote(root_directory_id, safe='')}/{encoded_name}?{query}"
-                  update_progress("uploading", f"Uploading {file_name} ({file_size_gb} GiB) into your BUZZHEAVIER account · {BUZZHEAVIER_REGION}.", file_name)
+                  upload_label = buzz_upload_name if buzz_upload_name != file_name else file_name
+                  update_progress("uploading", f"Uploading {upload_label} ({file_size_gb} GiB) into your BUZZHEAVIER account · {BUZZHEAVIER_REGION}.", file_name)
 
                   # Use BUZZHEAVIER's documented cURL -T upload method rather
                   # than requests.put() with a custom streaming iterator. This
