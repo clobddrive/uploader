@@ -5,9 +5,10 @@ on:
   repository_dispatch:
     types: [mirror_gdrive_file]
 
-# Each WordPress queue row has its own concurrency group. Different queue jobs
-# can therefore use separate GitHub-hosted runners in parallel, while duplicate
-# dispatches for the same queue job ID remain serialized and are not cancelled.
+# WordPress dispatches no more than 10 processing queue rows at a time.
+# Each queue row has its own concurrency group, so different job IDs can use
+# separate GitHub-hosted runners in parallel. Duplicate dispatches for the same
+# queue job ID remain serialized and are not allowed to cancel an active run.
 concurrency:
   group: clobd-upload-job-${{ github.event.client_payload.job_id }}
   cancel-in-progress: false
