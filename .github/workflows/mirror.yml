@@ -1,14 +1,15 @@
-name: CLOBD Multi-Cloud Sequential Upload Queue
+name: CLOBD Multi-Cloud Parallel Upload Queue
 run-name: "CLOBD Queue Job #${{ github.event.client_payload.job_id }} | ${{ github.event.client_payload.platform }}"
 
 on:
   repository_dispatch:
     types: [mirror_gdrive_file]
 
-# WordPress dispatches only one job at a time. This concurrency group is a
-# second safety layer in case a duplicate dispatch is accidentally sent.
+# Each WordPress queue row has its own concurrency group. Different queue jobs
+# can therefore use separate GitHub-hosted runners in parallel, while duplicate
+# dispatches for the same queue job ID remain serialized and are not cancelled.
 concurrency:
-  group: clobd-multi-cloud-upload-queue
+  group: clobd-upload-job-${{ github.event.client_payload.job_id }}
   cancel-in-progress: false
 
 jobs:
