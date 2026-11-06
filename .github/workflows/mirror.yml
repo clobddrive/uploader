@@ -86,6 +86,7 @@ jobs:
           FORCE_UPLOAD: ${{ github.event.client_payload.force_upload || 'no' }}
           GOFILE_API_TOKEN: ${{ github.event.client_payload.platform == 'gofile' && secrets.GOFILE_API_TOKEN || '' }}
           BUZZHEAVIER_ACCOUNT_ID: ${{ github.event.client_payload.platform == 'buzzheavier' && secrets.BUZZHEAVIER_ACCOUNT_ID || '' }}
+          FUCKINGFAST_ACCOUNT_ID: ${{ github.event.client_payload.platform == 'fuckingfast' && secrets.FUCKINGFAST_ACCOUNT_ID || '' }}
           GH_RUN_ID: ${{ github.run_id }}
           GH_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
@@ -113,9 +114,11 @@ jobs:
           PROVIDER_CONFIG = os.environ.get("PROVIDER_CONFIG", "").strip()
           PIXELDRAIN_API = PROVIDER_CONFIG if PLATFORM == "pixeldrain" else ""
           BUZZHEAVIER_REGION = PROVIDER_CONFIG if PLATFORM == "buzzheavier" and PROVIDER_CONFIG else "Asia-Pacific"
+          FUCKINGFAST_REGION = PROVIDER_CONFIG if PLATFORM == "fuckingfast" and PROVIDER_CONFIG else "Asia-Pacific"
           FORCE_UPLOAD = os.environ.get("FORCE_UPLOAD", "no").strip().lower() == "yes"
           GOFILE_API_TOKEN = os.environ.get("GOFILE_API_TOKEN", "").strip()
           BUZZHEAVIER_ACCOUNT_ID = os.environ.get("BUZZHEAVIER_ACCOUNT_ID", "").strip()
+          FUCKINGFAST_ACCOUNT_ID = os.environ.get("FUCKINGFAST_ACCOUNT_ID", "").strip()
           RUN_ID = os.environ.get("GH_RUN_ID", "").strip()
           try:
               RUN_ATTEMPT = max(1, int(os.environ.get("GH_RUN_ATTEMPT", "1").strip() or "1"))
@@ -157,6 +160,7 @@ jobs:
                   "pixeldrain_url": result_url if PLATFORM == "pixeldrain" else "",
                   'gofile_url': result_url if PLATFORM == "gofile" else "",
                   'buzzheavier_url': result_url if PLATFORM == "buzzheavier" else "",
+                  'fuckingfast_url': result_url if PLATFORM == "fuckingfast" else "",
                   'result_status': result_status,
                   "message": message,
               }
@@ -182,7 +186,7 @@ jobs:
               if not isinstance(data, dict) or data.get("success") is not True:
                   raise RuntimeError("WordPress duplicate-check endpoint did not return a valid result.")
               if data.get("duplicate"):
-                  return str(data.get("result_url") or data.get("pixeldrain_url") or data.get("gofile_url") or data.get("buzzheavier_url") or "").strip()
+                  return str(data.get("result_url") or data.get("pixeldrain_url") or data.get("gofile_url") or data.get("buzzheavier_url") or data.get("fuckingfast_url") or "").strip()
               return ""
 
           def request_google_cloud_fast_fallback():
@@ -347,7 +351,7 @@ jobs:
           try:
               if not JOB_ID or not POST_ID or not GDRIVE_ID:
                   raise RuntimeError("Queue job ID, WordPress post ID, or Google Drive file ID is missing.")
-              if PLATFORM not in ("pixeldrain", "gofile", "buzzheavier"):
+              if PLATFORM not in ("pixeldrain", "gofile", "buzzheavier", "fuckingfast"):
                   raise RuntimeError(f"Unsupported upload platform: {PLATFORM}")
               if PLATFORM == "pixeldrain" and not PIXELDRAIN_API:
                   raise RuntimeError("Pixeldrain API key is missing. Configure it in WordPress > Files > Settings.")
@@ -355,6 +359,8 @@ jobs:
                   raise RuntimeError("GitHub Actions secret GOFILE_API_TOKEN is missing. Save the Gofile token in WordPress > Files > Settings and verify that GitHub Secrets permission is enabled.")
               if PLATFORM == "buzzheavier" and not BUZZHEAVIER_ACCOUNT_ID:
                   raise RuntimeError("GitHub Actions secret BUZZHEAVIER_ACCOUNT_ID is missing. Enter your BUZZHEAVIER Account ID in WordPress > Files > Settings and validate/sync it.")
+              if PLATFORM == "fuckingfast" and not FUCKINGFAST_ACCOUNT_ID:
+                  raise RuntimeError("GitHub Actions secret FUCKINGFAST_ACCOUNT_ID is missing. Enter your FUCKINGFAST Account ID in WordPress > Files > Settings and validate/sync it.")
 
               download_dir = os.path.abspath("downloads")
               os.makedirs(download_dir, exist_ok=True)
@@ -478,7 +484,7 @@ jobs:
                       raise RuntimeError("Gofile reported success but did not return a valid public downloadPage URL.")
                   message = f"Gofile upload completed successfully. File size: {file_size_gb} GiB."
 
-              else:
+              elif PLATFORM == "buzzheavier":
                   # Authenticated account upload. The Account ID is injected only
                   # from the encrypted GitHub Actions secret (never client_payload).
                   allowed_regions = {
@@ -842,6 +848,494 @@ jobs:
 
                   result_url = f"https://buzzheavier.com/{quote(buzz_file_id, safe='')}"
                   message = f"BUZZHEAVIER authenticated account upload completed in {BUZZHEAVIER_REGION}. File size: {file_size_gb} GiB."
+
+
+              else:
+                  # FUCKINGFAST authenticated account upload. Its Account ID is
+                  # read only from the encrypted GitHub Actions secret.
+                  # Authenticated account upload. The Account ID is injected only
+                  # from the encrypted GitHub Actions secret (never client_payload).
+                  allowed_regions = {
+                      "Asia-Pacific", "Western Europe", "Eastern Europe",
+                      "Central Europe", "Eastern US", "Western US",
+                  }
+                  if FUCKINGFAST_REGION not in allowed_regions:
+                      raise RuntimeError(f"Unsupported FUCKINGFAST storage region: {FUCKINGFAST_REGION}")
+                  if not FUCKINGFAST_ACCOUNT_ID:
+                      raise RuntimeError("FUCKINGFAST_ACCOUNT_ID GitHub Actions secret is missing.")
+
+                  # FUCKINGFAST validates the filename parsed from the URL path.
+                  # CLOBD source names commonly use vertical bars as separators
+                  # (for example: "CLOBD.COM | Title | 1080p.mkv"). The API
+                  # responds with HTTP 400 "the Name field is invalid" for such
+                  # names. Keep the original filename for WordPress and other
+                  # providers; normalize only the remote FUCKINGFAST filename.
+                  import unicodedata
+                  fuckingfast_upload_name = unicodedata.normalize("NFC", file_name)
+                  fuckingfast_upload_name = re.sub(r"[\x00-\x1f\x7f]", "", fuckingfast_upload_name)
+                  # Replace path/filename-reserved characters with a hyphen.
+                  # Preserve Unicode letters, spaces, dots, parentheses and
+                  # ordinary punctuation used in movie titles.
+                  fuckingfast_upload_name = re.sub(r'[<>:"/\\|?*]', "-", fuckingfast_upload_name)
+                  fuckingfast_upload_name = re.sub(r"\s+", " ", fuckingfast_upload_name).strip(" .")
+                  fuckingfast_upload_name = re.sub(r"-{2,}", "-", fuckingfast_upload_name)
+                  if not fuckingfast_upload_name or fuckingfast_upload_name in (".", ".."):
+                      raise RuntimeError("FUCKINGFAST filename became empty after removing unsupported filename characters.")
+                  if len(fuckingfast_upload_name) > 500:
+                      raise RuntimeError(f"FUCKINGFAST filename exceeds the API's 500-character limit after normalization: {len(fuckingfast_upload_name)}")
+                  if fuckingfast_upload_name != file_name:
+                      print(f"::notice title=FUCKINGFAST Filename Normalized::Original CLOBD filename is preserved; FUCKINGFAST remote filename will be: {fuckingfast_upload_name}")
+
+                  fuckingfast_auth_headers = dict(HEADERS)
+                  fuckingfast_auth_headers["Authorization"] = f"Bearer {FUCKINGFAST_ACCOUNT_ID}"
+
+                  # Get the authenticated root directory. API docs specify that
+                  # account uploads must target a parent directory ID.
+                  update_progress("checking_account", "Authenticating with FUCKINGFAST and resolving the account root directory.", file_name)
+                  root_response = requests.get(
+                      "https://fuckingfast.net/api/fs",
+                      headers=fuckingfast_auth_headers,
+                      timeout=(20, 90),
+                  )
+                  if root_response.status_code != 200:
+                      raise RuntimeError(f"FUCKINGFAST File Manager authentication/root lookup failed (HTTP {root_response.status_code}): {root_response.text[:700]}")
+                  try:
+                      root_payload = root_response.json()
+                  except ValueError as error:
+                      raise RuntimeError("FUCKINGFAST File Manager returned invalid JSON for the root directory.") from error
+                  if not isinstance(root_payload, dict):
+                      raise RuntimeError("FUCKINGFAST File Manager returned an unexpected root-directory response.")
+
+                  def _is_scalar_id(value):
+                      return isinstance(value, (str, int)) and str(value).strip() != ""
+
+                  def _find_root_directory_id(payload):
+                      # Prefer explicit root/parent identifiers wherever the API
+                      # nests its root metadata, then use the id of the root node.
+                      preferred = ("rootId", "rootDirectoryId", "directoryId", "parentId", "folderId", "root_id", "parent_id")
+                      containers = []
+                      def collect_containers(value, depth=0):
+                          if depth > 8:
+                              return
+                          if isinstance(value, dict):
+                              containers.append(value)
+                              for child in value.values():
+                                  if isinstance(child, (dict, list)):
+                                      collect_containers(child, depth + 1)
+                          elif isinstance(value, list):
+                              for child in value:
+                                  if isinstance(child, (dict, list)):
+                                      collect_containers(child, depth + 1)
+                      collect_containers(payload)
+                      for container in containers:
+                          for key in preferred:
+                              value = container.get(key)
+                              if _is_scalar_id(value):
+                                  return str(value).strip()
+                      # Root nodes generally expose their own id plus contents;
+                      # also accept explicit root/current-directory wrappers.
+                      for container in containers:
+                          has_contents = any(k in container for k in ("files", "folders", "directories", "items", "children", "contents"))
+                          is_root_wrapper = any(k in container for k in ("root", "rootDirectory", "currentDirectory", "directory"))
+                          if has_contents or is_root_wrapper:
+                              for key in ("id", "_id"):
+                                  value = container.get(key)
+                                  if _is_scalar_id(value):
+                                      return str(value).strip()
+                      return ""
+
+                  root_directory_id = _find_root_directory_id(root_payload)
+                  if not root_directory_id:
+                      top_keys = ", ".join(str(k) for k in list(root_payload.keys())[:20])
+                      raise RuntimeError("FUCKINGFAST authenticated root response did not expose a root directory ID; upload stopped safely. Root response keys: " + (top_keys or "none"))
+
+                  # Find an exact filename match inside the same account root.
+                  # This protects against duplicates created outside CLOBD too.
+                  def _walk_named_items(value, depth=0):
+                      if depth > 8:
+                          return
+                      if isinstance(value, dict):
+                          name = value.get("name") or value.get("filename")
+                          item_id = value.get("id") or value.get("fileId") or value.get("file_id")
+                          item_type = str(value.get("type") or value.get("kind") or "").strip().casefold()
+                          is_directory = (value.get("isDirectory") is True) or (value.get("is_dir") is True) or item_type in ("directory", "folder", "dir")
+                          if isinstance(name, str) and _is_scalar_id(item_id) and not is_directory:
+                              yield name, str(item_id).strip(), value
+                          for key in ("data", "files", "folders", "directories", "items", "children", "contents", "result"):
+                              if key in value:
+                                  yield from _walk_named_items(value[key], depth + 1)
+                      elif isinstance(value, list):
+                          for item in value:
+                              yield from _walk_named_items(item, depth + 1)
+
+                  existing_account_file = None
+                  for existing_name, existing_id, existing_item in _walk_named_items(root_payload):
+                      if existing_name == fuckingfast_upload_name:
+                          existing_account_file = (existing_id, existing_item)
+                          break
+                  # A GitHub Actions "Re-run jobs" attempt can replay an upload
+                  # that already reached FUCKINGFAST but whose callback/parser
+                  # failed afterward. Reuse that exact account file on reruns,
+                  # even when the original job was dispatched as a forced upload.
+                  # A fresh run (run_attempt == 1) still respects explicit force
+                  # re-upload requests from the WordPress Cloud Monitor.
+                  is_github_workflow_rerun = RUN_ATTEMPT > 1
+                  if existing_account_file and (not FORCE_UPLOAD or is_github_workflow_rerun):
+                      fuckingfast_file_id, existing_fuckingfast_item = existing_account_file[0], existing_account_file[2]
+                      existing_fuckingfast_url = ""
+                      if isinstance(existing_fuckingfast_item, dict):
+                          for item_url_key in ("url", "downloadUrl", "download_url", "downloadPage", "shareUrl", "link"):
+                              candidate_item_url = existing_fuckingfast_item.get(item_url_key)
+                              if isinstance(candidate_item_url, str) and candidate_item_url.strip().startswith("https://"):
+                                  existing_fuckingfast_url = candidate_item_url.strip()
+                                  break
+                      if existing_fuckingfast_url:
+                          from urllib.parse import urlparse
+                          parsed_existing_url = urlparse(existing_fuckingfast_url)
+                          if parsed_existing_url.scheme != "https" or not parsed_existing_url.hostname or not (parsed_existing_url.hostname == "fuckingfast.net" or parsed_existing_url.hostname.endswith(".fuckingfast.net")):
+                              existing_fuckingfast_url = ""
+                      result_url = existing_fuckingfast_url or f"https://fuckingfast.net/{quote(fuckingfast_file_id, safe='')}"
+                      if is_github_workflow_rerun and FORCE_UPLOAD:
+                          message = "Skipped duplicate upload on GitHub workflow rerun: this exact filename already exists in your authenticated FUCKINGFAST account root. Reusing its existing link."
+                      else:
+                          message = "Skipped upload: this exact filename already exists in your authenticated FUCKINGFAST account root. Reusing its existing link."
+                      print(f"::notice title=FUCKINGFAST Duplicate::{file_name} already exists in account root as {fuckingfast_file_id}")
+                      update_progress("finishing", message, file_name)
+                      send_final_result("skipped_duplicate", file_name, result_url, message)
+                      final_sent = True
+                      sys.exit(0)
+
+                  # Resolve the current location ID from FUCKINGFAST's public API.
+                  # The documented location-specific upload route is /{name}?locationId=.
+                  # After upload, the authenticated File Manager move endpoint places
+                  # the file in the account root, matching account-owned BUZZHEAVIER copies.
+                  update_progress("uploading", f"Resolving FUCKINGFAST {FUCKINGFAST_REGION} storage location.", file_name)
+                  locations_response = requests.get(
+                      "https://fuckingfast.net/api/locations",
+                      headers=HEADERS,
+                      timeout=(20, 60),
+                  )
+                  locations_response.raise_for_status()
+                  try:
+                      locations_data = locations_response.json()
+                  except ValueError as error:
+                      raise RuntimeError("FUCKINGFAST locations API returned invalid JSON.") from error
+                  location_rows = locations_data.get("data") if isinstance(locations_data, dict) else None
+                  if not isinstance(location_rows, list):
+                      raise RuntimeError("FUCKINGFAST locations API did not return a valid data array.")
+                  location_id = ""
+                  for location in location_rows:
+                      if isinstance(location, dict) and str(location.get("name", "")).strip().casefold() == FUCKINGFAST_REGION.casefold():
+                          location_id = str(location.get("id", "")).strip()
+                          break
+                  if not location_id:
+                      available = ", ".join(str(x.get("name", "")) for x in location_rows if isinstance(x, dict))
+                      raise RuntimeError(f"FUCKINGFAST region '{FUCKINGFAST_REGION}' was not returned by the locations API. Available: {available or 'none'}")
+
+                  from urllib.parse import urlencode
+                  encoded_name = quote(fuckingfast_upload_name, safe="")
+                  query = urlencode({"locationId": location_id})
+                  upload_url = f"https://w.fuckingfast.net/{encoded_name}?{query}"
+                  upload_label = fuckingfast_upload_name if fuckingfast_upload_name != file_name else file_name
+                  update_progress("uploading", f"Uploading {upload_label} ({file_size_gb} GiB) into your FUCKINGFAST account · {FUCKINGFAST_REGION}.", file_name)
+
+                  # Use FUCKINGFAST's documented cURL -T upload method rather
+                  # than requests.put() with a custom streaming iterator. This
+                  # avoids the requests/urllib3 TLS EOF failure seen on large
+                  # uploads and lets curl retry a dropped upload connection.
+                  update_progress("uploading", f"Uploading {file_name} ({file_size_gb} GiB) into your FUCKINGFAST account · {FUCKINGFAST_REGION}.", file_name)
+
+                  curl_config_path = ""
+                  curl_response_path = ""
+                  try:
+                      # Keep the Account ID out of the curl process arguments.
+                      config_fd, curl_config_path = tempfile.mkstemp(prefix="clobd-fuckingfast-", suffix=".curl")
+                      os.chmod(curl_config_path, 0o600)
+                      safe_account_id = FUCKINGFAST_ACCOUNT_ID.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
+                      with os.fdopen(config_fd, "w", encoding="utf-8") as config_file:
+                          config_file.write(f'header = "Authorization: Bearer {safe_account_id}"\n')
+                          config_file.write('header = "Content-Type: application/octet-stream"\n')
+
+                      response_fd, curl_response_path = tempfile.mkstemp(prefix="clobd-fuckingfast-response-", suffix=".json")
+                      os.close(response_fd)
+
+                      curl_command = [
+                          "curl",
+                          "--http1.1",
+                          "--show-error",
+                          "--progress-bar",
+                          "--connect-timeout", "60",
+                          "--max-time", "0",
+                          "--keepalive-time", "30",
+                          "--retry", "4",
+                          "--retry-all-errors",
+                          "--retry-delay", "15",
+                          "--retry-max-time", "14400",
+                          "--upload-file", file_path,
+                          "--config", curl_config_path,
+                          "--output", curl_response_path,
+                          "--write-out", "\n%{http_code}",
+                          upload_url,
+                      ]
+
+                      print("::notice title=FUCKINGFAST Transport::Using documented cURL upload with up to 4 automatic retries for interrupted connections.")
+                      curl_process = subprocess.Popen(
+                          curl_command,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          text=True,
+                          encoding="utf-8",
+                          errors="replace",
+                          bufsize=1,
+                      )
+
+                      curl_stderr_lines = []
+                      curl_line_buffer = ""
+                      last_curl_percent = [-5]
+
+                      def _handle_curl_progress_line(line):
+                          line = line.strip()
+                          if not line:
+                              return
+                          curl_stderr_lines.append(line)
+                          lowered = line.casefold()
+                          if "will retry" in lowered or "retrying" in lowered:
+                              update_progress(
+                                  "uploading",
+                                  f"FUCKINGFAST connection was interrupted. cURL is retrying the upload from the beginning of the file ({FUCKINGFAST_REGION}).",
+                                  file_name,
+                              )
+                          match = re.search(r"(?<!\d)(\d{1,3}(?:\.\d+)?)%", line)
+                          if match:
+                              percent = max(0, min(100, int(float(match.group(1)))))
+                              if percent >= last_curl_percent[0] + 5 or percent == 100:
+                                  last_curl_percent[0] = percent
+                                  update_progress(
+                                      "uploading",
+                                      f"Uploading {file_name} into FUCKINGFAST account ({percent}% sent · {FUCKINGFAST_REGION}).",
+                                      file_name,
+                                  )
+
+                      # Read cURL's carriage-return progress meter live so the
+                      # WordPress Cloud Monitor continues receiving progress.
+                      while True:
+                          character = curl_process.stderr.read(1)
+                          if character == "":
+                              break
+                          if character in ("\r", "\n"):
+                              _handle_curl_progress_line(curl_line_buffer)
+                              curl_line_buffer = ""
+                          else:
+                              curl_line_buffer += character
+                      if curl_line_buffer:
+                          _handle_curl_progress_line(curl_line_buffer)
+
+                      curl_stdout = curl_process.stdout.read() if curl_process.stdout else ""
+                      curl_return_code = curl_process.wait()
+                      curl_http_text = (curl_stdout or "").strip().splitlines()
+                      try:
+                          curl_http_status = int(curl_http_text[-1]) if curl_http_text else 0
+                      except (TypeError, ValueError):
+                          curl_http_status = 0
+
+                      try:
+                          with open(curl_response_path, "r", encoding="utf-8", errors="replace") as response_file:
+                              curl_response_text = response_file.read()
+                      except OSError:
+                          curl_response_text = ""
+
+                      if curl_return_code != 0:
+                          useful_curl_errors = [
+                              line for line in curl_stderr_lines
+                              if any(token in line.casefold() for token in ("curl:", "error", "retry", "failed", "ssl", "timed out"))
+                          ]
+                          curl_error_detail = "\n".join(useful_curl_errors[-12:])[-1600:]
+                          if not curl_error_detail:
+                              curl_error_detail = f"cURL exited with code {curl_return_code} without additional diagnostics."
+                          raise RuntimeError(
+                              "FUCKINGFAST upload transport failed after automatic retries "
+                              f"(cURL exit {curl_return_code}). {curl_error_detail}"
+                          )
+
+                      if curl_http_status not in (200, 201):
+                          raise RuntimeError(
+                              f"Authenticated FUCKINGFAST account upload failed (HTTP {curl_http_status}): "
+                              f"{curl_response_text[:1200] or 'No response body'}"
+                          )
+
+                      try:
+                          upload_data = json.loads(curl_response_text)
+                      except ValueError:
+                          # The API documentation does not specify a response schema.
+                          # Accept JSON objects as well as a plain ID / HTTPS URL response.
+                          upload_data = {"raw": curl_response_text.strip()}
+
+                      response_code = upload_data.get("code") if isinstance(upload_data, dict) else None
+                      response_data = upload_data.get("data") if isinstance(upload_data, dict) and isinstance(upload_data.get("data"), dict) else upload_data
+                      fuckingfast_file_id = ""
+                      if isinstance(response_data, dict):
+                          for id_key in ("id", "fileId", "file_id", "hash"):
+                              candidate_id = response_data.get(id_key)
+                              if isinstance(candidate_id, (str, int)) and str(candidate_id).strip():
+                                  fuckingfast_file_id = str(candidate_id).strip()
+                                  break
+                      fuckingfast_returned_url = ""
+                      if isinstance(response_data, dict):
+                          for url_key in ("url", "downloadUrl", "download_url", "downloadPage", "downloadPageUrl", "shareUrl", "share_url", "link"):
+                              candidate_url = response_data.get(url_key)
+                              if isinstance(candidate_url, str) and candidate_url.strip().startswith("https://"):
+                                  fuckingfast_returned_url = candidate_url.strip()
+                                  break
+                      if isinstance(upload_data, str):
+                          raw_value = upload_data.strip()
+                      elif isinstance(upload_data, dict):
+                          raw_value = str(upload_data.get("raw", "")).strip()
+                      else:
+                          raw_value = ""
+                      if not fuckingfast_returned_url and raw_value:
+                          if raw_value.startswith("https://"):
+                              fuckingfast_returned_url = raw_value
+                          elif len(raw_value) <= 500 and " " not in raw_value:
+                              fuckingfast_file_id = raw_value
+
+                      # The developer page documents HTTP upload routes but not
+                      # their JSON response schema. Trust HTTP 200/201 above,
+                      # while still rejecting an explicit API-level failure.
+                      if isinstance(upload_data, dict):
+                          api_status = str(upload_data.get("status", "")).strip().casefold()
+                          if upload_data.get("success") is False or api_status in ("error", "failed", "failure"):
+                              raise RuntimeError(
+                                  "FUCKINGFAST API reported an unsuccessful upload: "
+                                  f"{curl_response_text[:1200]}"
+                              )
+                      # The API response schema is not documented. The authenticated
+                      # File Manager lookup below is the final source of truth for the ID.
+
+                      # The documented region-specific route does not take a parentId.
+                      # Verify that the authenticated upload is visible in the account
+                      # root; if it is not, move it with the documented File Manager API.
+                      def _find_fuckingfast_account_file(payload, expected_name, expected_id=""):
+                          first_exact_name = None
+                          for found_name, found_id, found_item in _walk_named_items(payload):
+                              if expected_id and found_id == expected_id:
+                                  return found_id, found_item
+                              if found_name == expected_name and first_exact_name is None:
+                                  first_exact_name = (found_id, found_item)
+                          return first_exact_name if first_exact_name is not None else ("", None)
+
+                      verify_root_response = requests.get(
+                          "https://fuckingfast.net/api/fs",
+                          headers=fuckingfast_auth_headers,
+                          timeout=(20, 90),
+                      )
+                      if verify_root_response.status_code != 200:
+                          raise RuntimeError(
+                              f"FUCKINGFAST post-upload account verification failed (HTTP {verify_root_response.status_code}): "
+                              f"{verify_root_response.text[:700]}"
+                          )
+                      try:
+                          verify_root_payload = verify_root_response.json()
+                      except ValueError as error:
+                          raise RuntimeError("FUCKINGFAST returned invalid JSON during post-upload account verification.") from error
+
+                      account_file_id, account_file_item = _find_fuckingfast_account_file(
+                          verify_root_payload, fuckingfast_upload_name, fuckingfast_file_id
+                      )
+                      if not account_file_id:
+                          if not fuckingfast_file_id:
+                              raise RuntimeError(
+                                  "FUCKINGFAST accepted the region upload but did not return a file ID, and the file was not found in the account root. "
+                                  "The file was not marked as a successful account upload."
+                              )
+                          move_response = requests.put(
+                              "https://fuckingfast.net/api/fs/" + quote(fuckingfast_file_id, safe=""),
+                              json={"parentId": root_directory_id},
+                              headers={**fuckingfast_auth_headers, "Content-Type": "application/json"},
+                              timeout=(20, 120),
+                          )
+                          if move_response.status_code not in (200, 201, 204):
+                              raise RuntimeError(
+                                  "FUCKINGFAST uploaded the file to the selected region, but moving it into the account root failed "
+                                  f"(HTTP {move_response.status_code}): {move_response.text[:900]}"
+                              )
+                          verify_root_response = requests.get(
+                              "https://fuckingfast.net/api/fs",
+                              headers=fuckingfast_auth_headers,
+                              timeout=(20, 90),
+                          )
+                          if verify_root_response.status_code != 200:
+                              raise RuntimeError(
+                                  "FUCKINGFAST moved the uploaded file, but account-root verification failed "
+                                  f"(HTTP {verify_root_response.status_code}): {verify_root_response.text[:700]}"
+                              )
+                          try:
+                              verify_root_payload = verify_root_response.json()
+                          except ValueError as error:
+                              raise RuntimeError("FUCKINGFAST returned invalid JSON after moving the uploaded file into the account root.") from error
+                          account_file_id, account_file_item = _find_fuckingfast_account_file(
+                              verify_root_payload, fuckingfast_upload_name, fuckingfast_file_id
+                          )
+                          if not account_file_id:
+                              raise RuntimeError(
+                                  "FUCKINGFAST accepted and moved the upload, but the exact filename could not be verified in the authenticated account root. "
+                                  "The link was not saved to WordPress to avoid reporting a non-account upload as complete."
+                              )
+
+                      # Prefer the File Manager's ID and public-link fields after
+                      # verifying that this exact filename belongs to the account.
+                      if account_file_id:
+                          if fuckingfast_file_id and account_file_id != fuckingfast_file_id:
+                              print("::warning title=FUCKINGFAST File ID::The File Manager ID differs from the upload response; using the verified account File Manager ID.")
+                          fuckingfast_file_id = account_file_id
+                      if isinstance(account_file_item, dict) and not fuckingfast_returned_url:
+                          for item_url_key in ("url", "downloadUrl", "download_url", "downloadPage", "downloadPageUrl", "shareUrl", "share_url", "link"):
+                              candidate_item_url = account_file_item.get(item_url_key)
+                              if isinstance(candidate_item_url, str) and candidate_item_url.strip().startswith("https://"):
+                                  fuckingfast_returned_url = candidate_item_url.strip()
+                                  break
+
+                      if fuckingfast_returned_url:
+                          from urllib.parse import urlparse
+                          parsed_fuckingfast_url = urlparse(fuckingfast_returned_url)
+                          if parsed_fuckingfast_url.scheme != "https" or not parsed_fuckingfast_url.hostname or not (parsed_fuckingfast_url.hostname == "fuckingfast.net" or parsed_fuckingfast_url.hostname.endswith(".fuckingfast.net")):
+                              raise RuntimeError("FUCKINGFAST returned a URL outside the official HTTPS domain. Upload result was not saved.")
+
+                      returned_name = str(response_data.get("name", "")).strip() if isinstance(response_data, dict) else ""
+                      if returned_name and returned_name != fuckingfast_upload_name:
+                          raise RuntimeError(
+                              "FUCKINGFAST accepted the upload but returned an unexpected filename. "
+                              f"Expected '{fuckingfast_upload_name}', received '{returned_name}'."
+                          )
+                      returned_size = response_data.get("size") if isinstance(response_data, dict) else None
+                      if returned_size is not None:
+                          try:
+                              if int(returned_size) != int(os.path.getsize(file_path)):
+                                  raise RuntimeError(
+                                      "FUCKINGFAST returned a file size that does not match the uploaded source: "
+                                      f"expected {os.path.getsize(file_path)} bytes, received {returned_size} bytes."
+                                  )
+                          except (TypeError, ValueError):
+                              print("::warning title=FUCKINGFAST Response::Could not parse returned file size; file ID was present and API success code was accepted.")
+                      returned_location_id = str(response_data.get("locationId", "")).strip() if isinstance(response_data, dict) else ""
+                      if returned_location_id and returned_location_id != location_id:
+                          print(
+                              f"::warning title=FUCKINGFAST Region::Requested location {location_id}, "
+                              f"but API response reports {returned_location_id}. Check the file in FUCKINGFAST File Manager."
+                          )
+                      print(
+                          f"::notice title=FUCKINGFAST Upload Accepted::API code {response_code or curl_http_status}; "
+                          f"file ID {fuckingfast_file_id}; remote name {returned_name or fuckingfast_upload_name}."
+                      )
+                  finally:
+                      for temporary_path in (curl_config_path, curl_response_path):
+                          if temporary_path:
+                              try:
+                                  os.remove(temporary_path)
+                              except OSError:
+                                  pass
+
+                  result_url = fuckingfast_returned_url or f"https://fuckingfast.net/{quote(fuckingfast_file_id, safe='')}"
+                  message = f"FUCKINGFAST authenticated account upload completed in {FUCKINGFAST_REGION}. File size: {file_size_gb} GiB."
 
               print(f"::notice title={PLATFORM.title()} Upload Complete::{result_url}")
               update_progress("finishing", f"Upload completed; saving the {PLATFORM} URL to WordPress.", file_name)
