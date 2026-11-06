@@ -1034,8 +1034,13 @@ jobs:
 
                   from urllib.parse import urlencode
                   encoded_name = quote(fuckingfast_upload_name, safe="")
+                  encoded_root_id = quote(root_directory_id, safe="")
                   query = urlencode({"locationId": location_id})
-                  upload_url = f"https://w.fuckingfast.net/{encoded_name}?{query}"
+                  # Upload directly into the authenticated account root. The
+                  # documented /{parentId}/{name} route avoids a second File
+                  # Manager move request, which currently returns HTTP 405.
+                  # Keep the selected storage location in the query string.
+                  upload_url = f"https://w.fuckingfast.net/{encoded_root_id}/{encoded_name}?{query}"
                   upload_label = fuckingfast_upload_name if fuckingfast_upload_name != file_name else file_name
                   update_progress("uploading", f"Uploading {upload_label} ({file_size_gb} GiB) into your FUCKINGFAST account · {FUCKINGFAST_REGION}.", file_name)
 
@@ -1078,7 +1083,7 @@ jobs:
                           upload_url,
                       ]
 
-                      print("::notice title=FUCKINGFAST Transport::Using documented cURL upload with up to 4 automatic retries for interrupted connections.")
+                      print("::notice title=FUCKINGFAST Transport::Uploading directly into the authenticated account root with the documented cURL transport and up to 4 automatic retries for interrupted connections.")
                       curl_process = subprocess.Popen(
                           curl_command,
                           stdout=subprocess.PIPE,
@@ -1211,9 +1216,9 @@ jobs:
                       # The API response schema is not documented. The authenticated
                       # File Manager lookup below is the final source of truth for the ID.
 
-                      # The documented region-specific route does not take a parentId.
-                      # Verify that the authenticated upload is visible in the account
-                      # root; if it is not, move it with the documented File Manager API.
+                      # The upload was addressed to the authenticated root directory
+                      # itself, so no post-upload move operation is required. Verify the
+                      # account root before reporting success to WordPress.
                       def _find_fuckingfast_account_file(payload, expected_name, expected_id=""):
                           first_exact_name = None
                           for found_name, found_id, found_item in _walk_named_items(payload):
@@ -1242,44 +1247,13 @@ jobs:
                           verify_root_payload, fuckingfast_upload_name, fuckingfast_file_id
                       )
                       if not account_file_id:
-                          if not fuckingfast_file_id:
-                              raise RuntimeError(
-                                  "FUCKINGFAST accepted the region upload but did not return a file ID, and the file was not found in the account root. "
-                                  "The file was not marked as a successful account upload."
-                              )
-                          move_response = requests.put(
-                              "https://fuckingfast.net/api/fs/" + quote(fuckingfast_file_id, safe=""),
-                              json={"parentId": root_directory_id},
-                              headers={**fuckingfast_auth_headers, "Content-Type": "application/json"},
-                              timeout=(20, 120),
+                          detail_id = f" Upload response file ID: {fuckingfast_file_id}." if fuckingfast_file_id else " The upload response did not include a usable file ID."
+                          raise RuntimeError(
+                              "FUCKINGFAST accepted the upload request, but the exact filename could not be verified "
+                              "inside the authenticated account root. The link was not saved to WordPress to avoid "
+                              "reporting a file outside the account root as complete."
+                              + detail_id
                           )
-                          if move_response.status_code not in (200, 201, 204):
-                              raise RuntimeError(
-                                  "FUCKINGFAST uploaded the file to the selected region, but moving it into the account root failed "
-                                  f"(HTTP {move_response.status_code}): {move_response.text[:900]}"
-                              )
-                          verify_root_response = requests.get(
-                              "https://fuckingfast.net/api/fs",
-                              headers=fuckingfast_auth_headers,
-                              timeout=(20, 90),
-                          )
-                          if verify_root_response.status_code != 200:
-                              raise RuntimeError(
-                                  "FUCKINGFAST moved the uploaded file, but account-root verification failed "
-                                  f"(HTTP {verify_root_response.status_code}): {verify_root_response.text[:700]}"
-                              )
-                          try:
-                              verify_root_payload = verify_root_response.json()
-                          except ValueError as error:
-                              raise RuntimeError("FUCKINGFAST returned invalid JSON after moving the uploaded file into the account root.") from error
-                          account_file_id, account_file_item = _find_fuckingfast_account_file(
-                              verify_root_payload, fuckingfast_upload_name, fuckingfast_file_id
-                          )
-                          if not account_file_id:
-                              raise RuntimeError(
-                                  "FUCKINGFAST accepted and moved the upload, but the exact filename could not be verified in the authenticated account root. "
-                                  "The link was not saved to WordPress to avoid reporting a non-account upload as complete."
-                              )
 
                       # Prefer the File Manager's ID and public-link fields after
                       # verifying that this exact filename belongs to the account.
