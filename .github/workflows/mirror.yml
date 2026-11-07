@@ -1388,53 +1388,86 @@ jobs:
                   ):
                       raise RuntimeError("FUCKINGFAST did not produce an HTTPS public page URL on its official domain. No link was saved.")
 
-                  # Probe the page/byte-range endpoint before calling WordPress.
-                  # A 404/410 or an explicit unavailable-page body is never saved.
-                  with requests.get(
-                      result_url,
-                      headers={
-                          "User-Agent": HEADERS["User-Agent"],
-                          "Accept": "text/html,application/octet-stream;q=0.9,*/*;q=0.8",
-                          "Range": "bytes=0-4095",
-                      },
-                      stream=True,
-                      allow_redirects=True,
-                      timeout=(20, 60),
-                  ) as link_check_response:
-                      if link_check_response.status_code < 200 or link_check_response.status_code >= 400:
-                          raise RuntimeError(
-                              f"FUCKINGFAST public-link verification failed (HTTP {link_check_response.status_code}). "
-                              "The new URL was not saved to WordPress."
-                          )
-                      final_public_url = urlparse(link_check_response.url)
-                      if final_public_url.scheme != "https" or not final_public_url.hostname or not (
-                          final_public_url.hostname == "fuckingfast.net" or final_public_url.hostname.endswith(".fuckingfast.net")
-                      ):
-                          raise RuntimeError("FUCKINGFAST public link redirected outside its official HTTPS domain. The link was not saved.")
-                      link_preview = bytearray()
-                      for preview_chunk in link_check_response.iter_content(chunk_size=4096):
-                          if preview_chunk:
-                              link_preview.extend(preview_chunk[:4096])
-                          if len(link_preview) >= 16384:
-                              break
-                      preview_text = bytes(link_preview).decode("utf-8", errors="ignore").casefold()
-                      unavailable_markers = (
-                          "file not found",
-                          "this file was deleted",
-                          "file has been deleted",
-                          "file does not exist",
-                          "file is unavailable",
-                          "this file is no longer available",
-                          "file has expired",
-                          "download not found",
-                          "404 not found",
+                  # Public page probes can be challenged by the provider's edge/WAF.
+                  # The upload has already been verified independently through the
+                  # authenticated File Manager (job-isolated directory, exact original
+                  # filename, file ID and source size). Therefore 403/429/5xx or a
+                  # transient network error are inconclusive, not proof of a dead file.
+                  # Only explicit 404/410 responses or an explicit unavailable page
+                  # are treated as a failed public link. Never invent a new filename.
+                  public_probe_note = "Public page probe completed."
+                  try:
+                      with requests.get(
+                          result_url,
+                          headers={
+                              # Use a normal browser UA; the previous CLOBD bot UA
+                              # could trigger automated-request protection.
+                              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/octet-stream;q=0.8,*/*;q=0.7",
+                              "Accept-Language": "en-US,en;q=0.9",
+                              "Range": "bytes=0-4095",
+                          },
+                          stream=True,
+                          allow_redirects=True,
+                          timeout=(20, 60),
+                      ) as link_check_response:
+                          probe_status = int(link_check_response.status_code)
+                          final_public_url = urlparse(link_check_response.url)
+                          if final_public_url.scheme != "https" or not final_public_url.hostname or not (
+                              final_public_url.hostname == "fuckingfast.net" or final_public_url.hostname.endswith(".fuckingfast.net")
+                          ):
+                              raise RuntimeError("FUCKINGFAST public link redirected outside its official HTTPS domain. The link was not saved.")
+
+                          if probe_status in (404, 410):
+                              raise RuntimeError(
+                                  f"FUCKINGFAST public link returned HTTP {probe_status}. "
+                                  "The provider reports the public page is missing; the URL was not saved."
+                              )
+                          if probe_status < 200 or probe_status >= 400:
+                              public_probe_note = (
+                                  f"Public-page probe was inconclusive (HTTP {probe_status}); "
+                                  "the exact file ID/name/size were verified in the authenticated isolated directory."
+                              )
+                              print(
+                                  f"::warning title=FUCKINGFAST Public Link Probe::{public_probe_note} "
+                                  "Keeping the canonical file-ID URL instead of falsely marking the successful upload as failed."
+                              )
+                          else:
+                              link_preview = bytearray()
+                              for preview_chunk in link_check_response.iter_content(chunk_size=4096):
+                                  if preview_chunk:
+                                      link_preview.extend(preview_chunk[:4096])
+                                  if len(link_preview) >= 16384:
+                                      break
+                              preview_text = bytes(link_preview).decode("utf-8", errors="ignore").casefold()
+                              unavailable_markers = (
+                                  "file not found",
+                                  "this file was deleted",
+                                  "file has been deleted",
+                                  "file does not exist",
+                                  "file is unavailable",
+                                  "this file is no longer available",
+                                  "file has expired",
+                                  "download not found",
+                                  "404 not found",
+                              )
+                              if any(marker in preview_text for marker in unavailable_markers):
+                                  raise RuntimeError("FUCKINGFAST returned an unavailable/deleted-file page for the new upload. The link was not saved.")
+                  except requests.RequestException as probe_error:
+                      public_probe_note = (
+                          "Public-page probe could not complete; "
+                          "the exact file ID/name/size were verified in the authenticated isolated directory."
                       )
-                      if any(marker in preview_text for marker in unavailable_markers):
-                          raise RuntimeError("FUCKINGFAST returned an unavailable/deleted-file page for the new upload. The link was not saved.")
+                      print(
+                          f"::warning title=FUCKINGFAST Public Link Probe::{public_probe_note} "
+                          f"Network detail: {str(probe_error)[:500]}"
+                      )
 
                   message = (
-                      f"FUCKINGFAST authenticated upload completed and verified in {FUCKINGFAST_REGION}. "
-                      f"Remote filename (no generated suffix): {fuckingfast_upload_name}. File size: {file_size_gb} GiB."
+                      f"FUCKINGFAST authenticated upload completed and the exact file ID/name/size were verified "
+                      f"in the isolated account directory ({FUCKINGFAST_REGION}). "
+                      f"Remote filename (no generated suffix): {fuckingfast_upload_name}. "
+                      f"File size: {file_size_gb} GiB. {public_probe_note}"
                   )
 
               print(f"::notice title={PLATFORM.title()} Upload Complete::{result_url}")
