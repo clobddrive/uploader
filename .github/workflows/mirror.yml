@@ -687,7 +687,6 @@ jobs:
                           "--max-time", "0",
                           "--keepalive-time", "30",
                           "--retry", "4",
-                          "--retry-all-errors",
                           "--retry-delay", "15",
                           "--retry-max-time", "14400",
                           "--upload-file", file_path,
@@ -864,27 +863,23 @@ jobs:
                   if not FUCKINGFAST_ACCOUNT_ID:
                       raise RuntimeError("FUCKINGFAST_ACCOUNT_ID GitHub Actions secret is missing.")
 
-                  # FUCKINGFAST validates the filename parsed from the URL path.
-                  # CLOBD source names commonly use vertical bars as separators
-                  # (for example: "CLOBD.COM | Title | 1080p.mkv"). The API
-                  # responds with HTTP 400 "the Name field is invalid" for such
-                  # names. Keep the original filename for WordPress and other
-                  # providers; normalize only the remote FUCKINGFAST filename.
-                  import unicodedata
-                  fuckingfast_upload_name = unicodedata.normalize("NFC", file_name)
-                  fuckingfast_upload_name = re.sub(r"[\x00-\x1f\x7f]", "", fuckingfast_upload_name)
-                  # Replace path/filename-reserved characters with a hyphen.
-                  # Preserve Unicode letters, spaces, dots, parentheses and
-                  # ordinary punctuation used in movie titles.
-                  fuckingfast_upload_name = re.sub(r'[<>:"/\\|?*]', "-", fuckingfast_upload_name)
-                  fuckingfast_upload_name = re.sub(r"\s+", " ", fuckingfast_upload_name).strip(" .")
-                  fuckingfast_upload_name = re.sub(r"-{2,}", "-", fuckingfast_upload_name)
-                  if not fuckingfast_upload_name or fuckingfast_upload_name in (".", ".."):
-                      raise RuntimeError("FUCKINGFAST filename became empty after removing unsupported filename characters.")
+                  # Preserve the source filename exactly on FUCKINGFAST.
+                  # Do not normalize Unicode, replace punctuation, trim spaces,
+                  # or append any job-specific suffix. quote() below safely
+                  # URL-encodes the exact name as one path segment.
+                  fuckingfast_upload_name = file_name
+                  if not fuckingfast_upload_name:
+                      raise RuntimeError("FUCKINGFAST upload stopped: the original source filename is empty.")
                   if len(fuckingfast_upload_name) > 500:
-                      raise RuntimeError(f"FUCKINGFAST filename exceeds the API's 500-character limit after normalization: {len(fuckingfast_upload_name)}")
-                  if fuckingfast_upload_name != file_name:
-                      print(f"::notice title=FUCKINGFAST Filename Normalized::Original CLOBD filename is preserved; FUCKINGFAST remote filename will be: {fuckingfast_upload_name}")
+                      raise RuntimeError(
+                          "FUCKINGFAST filename exceeds the API's 500-character limit. "
+                          "The original filename was not changed."
+                      )
+                  if re.search(r"[\x00-\x1f\x7f]", fuckingfast_upload_name):
+                      raise RuntimeError(
+                          "FUCKINGFAST cannot receive this filename because it contains control characters. "
+                          "The original filename was not changed."
+                      )
 
                   fuckingfast_auth_headers = dict(HEADERS)
                   fuckingfast_auth_headers["Authorization"] = f"Bearer {FUCKINGFAST_ACCOUNT_ID}"
@@ -973,15 +968,13 @@ jobs:
                       if existing_name == fuckingfast_upload_name:
                           existing_account_file = (existing_id, existing_item)
                           break
-                  # A GitHub Actions "Re-run jobs" attempt can replay an upload
-                  # that already reached FUCKINGFAST but whose callback/parser
-                  # failed afterward. Reuse that exact account file on reruns,
-                  # even when the original job was dispatched as a forced upload.
-                  # A fresh run (run_attempt == 1) still respects explicit force
-                  # re-upload requests from the WordPress Cloud Monitor.
+                  # Reuse an exact account file whenever it is already present.
+                  # FORCE_UPLOAD bypasses only WordPress queue history; it never
+                  # disables the live account duplicate check for this provider.
+                  # This also makes GitHub workflow re-runs safe after partial success.
                   is_github_workflow_rerun = RUN_ATTEMPT > 1
-                  if existing_account_file and (not FORCE_UPLOAD or is_github_workflow_rerun):
-                      fuckingfast_file_id, existing_fuckingfast_item = existing_account_file[0], existing_account_file[2]
+                  if existing_account_file:
+                      fuckingfast_file_id, existing_fuckingfast_item = existing_account_file
                       existing_fuckingfast_url = ""
                       if isinstance(existing_fuckingfast_item, dict):
                           for item_url_key in ("url", "downloadUrl", "download_url", "downloadPage", "shareUrl", "link"):
@@ -1084,6 +1077,12 @@ jobs:
                       ]
 
                       print("::notice title=FUCKINGFAST Transport::Uploading directly into the authenticated account root with the documented cURL transport and up to 4 automatic retries for interrupted connections.")
+                      # HTTP 400 with this exact duplicate-name message is not
+                      # a transient transport error. Refresh the account root
+                      # once and reuse the existing file only when its exact
+                      # original filename is visible. Never invent an alternate
+                      # filename: CLOBD requires an exact remote-name match.
+                      remote_duplicate_reused = False
                       curl_process = subprocess.Popen(
                           curl_command,
                           stdout=subprocess.PIPE,
@@ -1107,7 +1106,7 @@ jobs:
                           if "will retry" in lowered or "retrying" in lowered:
                               update_progress(
                                   "uploading",
-                                  f"FUCKINGFAST connection was interrupted. cURL is retrying the upload from the beginning of the file ({FUCKINGFAST_REGION}).",
+                                  f"FUCKINGFAST connection was interrupted. cURL is retrying the upload ({FUCKINGFAST_REGION}).",
                                   file_name,
                               )
                           match = re.search(r"(?<!\d)(\d{1,3}(?:\.\d+)?)%", line)
@@ -1117,7 +1116,7 @@ jobs:
                                   last_curl_percent[0] = percent
                                   update_progress(
                                       "uploading",
-                                      f"Uploading {file_name} into FUCKINGFAST account ({percent}% sent · {FUCKINGFAST_REGION}).",
+                                      f"Uploading the exact original filename to FUCKINGFAST ({percent}% sent · {FUCKINGFAST_REGION}).",
                                       file_name,
                                   )
 
@@ -1163,10 +1162,62 @@ jobs:
                           )
 
                       if curl_http_status not in (200, 201):
-                          raise RuntimeError(
-                              f"Authenticated FUCKINGFAST account upload failed (HTTP {curl_http_status}): "
-                              f"{curl_response_text[:1200] or 'No response body'}"
+                          is_filename_collision = (
+                              curl_http_status == 400
+                              and "file already exists with the same name" in (curl_response_text or "").casefold()
                           )
+                          if is_filename_collision:
+                              conflict_root_response = requests.get(
+                                  "https://fuckingfast.net/api/fs",
+                                  headers=fuckingfast_auth_headers,
+                                  timeout=(20, 90),
+                              )
+                              if conflict_root_response.status_code == 200:
+                                  try:
+                                      conflict_root_payload = conflict_root_response.json()
+                                  except ValueError:
+                                      conflict_root_payload = {}
+                                  for conflict_name, conflict_id, conflict_item in _walk_named_items(conflict_root_payload):
+                                      if conflict_name == fuckingfast_upload_name:
+                                          fuckingfast_file_id = conflict_id
+                                          fuckingfast_returned_url = ""
+                                          if isinstance(conflict_item, dict):
+                                              for item_url_key in ("url", "downloadUrl", "download_url", "downloadPage", "downloadPageUrl", "shareUrl", "share_url", "link"):
+                                                  candidate_item_url = conflict_item.get(item_url_key)
+                                                  if isinstance(candidate_item_url, str) and candidate_item_url.strip().startswith("https://"):
+                                                      fuckingfast_returned_url = candidate_item_url.strip()
+                                                      break
+                                          if fuckingfast_returned_url:
+                                              from urllib.parse import urlparse
+                                              parsed_conflict_url = urlparse(fuckingfast_returned_url)
+                                              if parsed_conflict_url.scheme != "https" or not parsed_conflict_url.hostname or not (parsed_conflict_url.hostname == "fuckingfast.net" or parsed_conflict_url.hostname.endswith(".fuckingfast.net")):
+                                                  fuckingfast_returned_url = ""
+                                          remote_duplicate_reused = True
+                                          print(f"::notice title=FUCKINGFAST Duplicate Recovered::{fuckingfast_upload_name} already exists in the account; reusing its existing file ID {fuckingfast_file_id}.")
+                                          break
+
+                              if not remote_duplicate_reused:
+                                  raise RuntimeError(
+                                      "FUCKINGFAST says the exact original filename already exists (HTTP 400), "
+                                      "but that file was not returned by the account root listing. "
+                                      "No alternate filename was generated and no renamed upload was attempted. "
+                                      "Check the FUCKINGFAST File Manager, including any folders or deleted/trash area, "
+                                      "and permanently remove the conflicting copy or restore it before retrying. "
+                                      f"Original filename: {fuckingfast_upload_name}. API response: {curl_response_text[:900]}"
+                                  )
+                          else:
+                              raise RuntimeError(
+                                  f"Authenticated FUCKINGFAST account upload failed (HTTP {curl_http_status}): "
+                                  f"{curl_response_text[:1200] or 'No response body'}"
+                              )
+
+                      if remote_duplicate_reused:
+                          result_url = fuckingfast_returned_url or f"https://fuckingfast.net/{quote(fuckingfast_file_id, safe='')}"
+                          message = "Skipped duplicate upload: FUCKINGFAST already had this exact original filename in the authenticated account. Reusing its existing account link."
+                          update_progress("finishing", message, file_name)
+                          send_final_result("skipped_duplicate", file_name, result_url, message)
+                          final_sent = True
+                          sys.exit(0)
 
                       try:
                           upload_data = json.loads(curl_response_text)
@@ -1310,6 +1361,8 @@ jobs:
 
                   result_url = fuckingfast_returned_url or f"https://fuckingfast.net/{quote(fuckingfast_file_id, safe='')}"
                   message = f"FUCKINGFAST authenticated account upload completed in {FUCKINGFAST_REGION}. File size: {file_size_gb} GiB."
+                  if fuckingfast_upload_name != file_name:
+                      message += f" Remote filename: {fuckingfast_upload_name}. Original CLOBD filename was preserved in WordPress."
 
               print(f"::notice title={PLATFORM.title()} Upload Complete::{result_url}")
               update_progress("finishing", f"Upload completed; saving the {PLATFORM} URL to WordPress.", file_name)
