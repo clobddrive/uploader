@@ -71,7 +71,7 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip gdown requests requests-toolbelt
 
-      - name: Download, Check Exact Filename, and Upload to Selected Provider
+      - name: Download and Upload to Selected Provider
         shell: python
         env:
           JOB_ID: ${{ github.event.client_payload.job_id }}
@@ -396,21 +396,24 @@ jobs:
               print(f"::notice title=Downloaded::{file_name} | {file_size_gb} GiB")
 
               if PLATFORM == "fuckingfast":
-                  # FUCKINGFAST links can expire and its account can reject
-                  # duplicate names. Never reuse a saved URL or historical
-                  # queue result for this provider; upload a fresh copy instead.
-                  print("::notice title=FUCKINGFAST Fresh Upload::Skipping WordPress history and File Manager duplicate checks. A new account copy will be uploaded with the same remote filename.")
+                  # FUCKINGFAST links can expire or be deleted while their old
+                  # WordPress history remains. Never reuse a saved FF URL based
+                  # only on filename/history; this provider must perform a fresh
+                  # upload and verify the newly-created public link.
+                  update_progress("checking_account", "FUCKINGFAST: bypassing old filename history and preparing a fresh account upload.", file_name)
+                  print(f"::notice title=FUCKINGFAST Fresh Upload::Skipping WordPress filename/history duplicate checks for {file_name}.")
+                  existing_url = ""
               else:
                   update_progress("checking_duplicate", f"Checking {PLATFORM} for an exact filename match.", file_name)
                   existing_url = find_wordpress_duplicate(file_name)
-                  if existing_url:
-                      result_url = existing_url
-                      message = f"Skipped upload: this exact filename already has a successful {PLATFORM} link in CLOBD upload history. Reusing its saved link."
-                      print(f"::notice title=Duplicate Skipped::{file_name} already exists in CLOBD {PLATFORM} history")
-                      update_progress("finishing", message, file_name)
-                      send_final_result("skipped_duplicate", file_name, result_url, message)
-                      final_sent = True
-                      sys.exit(0)
+              if existing_url:
+                  result_url = existing_url
+                  message = f"Skipped upload: this exact filename already has a successful {PLATFORM} link in CLOBD upload history. Reusing its saved link."
+                  print(f"::notice title=Duplicate Skipped::{file_name} already exists in CLOBD {PLATFORM} history")
+                  update_progress("finishing", message, file_name)
+                  send_final_result("skipped_duplicate", file_name, result_url, message)
+                  final_sent = True
+                  sys.exit(0)
 
               if PLATFORM == "pixeldrain":
                   existing_id, existing_url = ("", "") if FORCE_UPLOAD else find_exact_pixeldrain_duplicate(file_name)
@@ -955,99 +958,107 @@ jobs:
                       top_keys = ", ".join(str(k) for k in list(root_payload.keys())[:20])
                       raise RuntimeError("FUCKINGFAST authenticated root response did not expose a root directory ID; upload stopped safely. Root response keys: " + (top_keys or "none"))
 
-                  # Do not scan the File Manager for duplicates. A previous
-                  # copy may be expired, deleted, or still be present under a
-                  # conflicting name. Put every upload attempt in a new account
-                  # folder while keeping the actual remote filename unchanged.
-                  # This avoids filename collisions without inventing names like
-                  # "file (1).mkv" or reusing an unverified old link.
-                  upload_folder_name = (
-                      f"CLOBD-P{POST_ID}-J{JOB_ID}-R{RUN_ID or 'unknown'}-A{RUN_ATTEMPT}"
-                  )
-                  upload_folder_name = re.sub(r"[^A-Za-z0-9._-]+", "-", upload_folder_name)[:120]
-                  update_progress(
-                      "checking_account",
-                      f"Creating a fresh FUCKINGFAST upload folder for this attempt ({FUCKINGFAST_REGION}).",
-                      file_name,
-                  )
-                  create_folder_response = requests.post(
-                      f"https://fuckingfast.net/api/fs/{quote(root_directory_id, safe='')}",
-                      json={"name": upload_folder_name},
-                      headers=fuckingfast_auth_headers,
+                  # Do not search the account File Manager for a matching filename.
+                  # Each GitHub queue run gets its own private directory so an
+                  # older root-level file (or another post with a normalized
+                  # filename collision) cannot block this upload. The stable
+                  # provider-safe name is used inside the folder with no suffix.
+                  folder_name = f"CLOBD-P{POST_ID}-J{JOB_ID}-R{RUN_ID or 'local'}-A{RUN_ATTEMPT}"
+                  root_id_encoded = quote(root_directory_id, safe="")
+                  folder_create_response = requests.post(
+                      f"https://fuckingfast.net/api/fs/{root_id_encoded}",
+                      headers={**fuckingfast_auth_headers, "Content-Type": "application/json"},
+                      json={"name": folder_name},
                       timeout=(20, 90),
                   )
-                  if create_folder_response.status_code not in (200, 201):
+                  if folder_create_response.status_code not in (200, 201):
                       raise RuntimeError(
-                          "FUCKINGFAST could not create the isolated upload folder "
-                          f"(HTTP {create_folder_response.status_code}): {create_folder_response.text[:900]}"
+                          "FUCKINGFAST could not create this job's isolated upload directory "
+                          f"(HTTP {folder_create_response.status_code}): {folder_create_response.text[:900]}"
                       )
                   try:
-                      create_folder_payload = create_folder_response.json()
+                      folder_create_payload = folder_create_response.json()
                   except ValueError as error:
-                      raise RuntimeError("FUCKINGFAST returned invalid JSON when creating the upload folder.") from error
+                      raise RuntimeError("FUCKINGFAST returned invalid JSON after creating the isolated upload directory.") from error
+                  if not isinstance(folder_create_payload, dict):
+                      raise RuntimeError("FUCKINGFAST returned an unexpected upload-directory response.")
 
-                  def _find_created_directory_id(value, depth=0):
+                  def _walk_json_dicts(value, depth=0):
                       if depth > 10:
-                          return ""
+                          return
                       if isinstance(value, dict):
-                          candidate_name = str(value.get("name") or value.get("folderName") or "").strip()
-                          if candidate_name == upload_folder_name:
-                              for key in ("id", "_id", "directoryId", "folderId", "directory_id", "folder_id"):
-                                  candidate = value.get(key)
-                                  if _is_scalar_id(candidate):
-                                      return str(candidate).strip()
-                          for key in ("data", "folder", "directory", "item", "result", "created"):
-                              if key in value:
-                                  candidate = _find_created_directory_id(value[key], depth + 1)
-                                  if candidate:
-                                      return candidate
-                          # Some API versions return the newly-created folder
-                          # directly as {"id": "..."} without repeating its name.
-                          for key in ("directoryId", "folderId", "directory_id", "folder_id", "id", "_id"):
-                              candidate = value.get(key)
-                              if _is_scalar_id(candidate):
-                                  return str(candidate).strip()
+                          yield value
+                          for child in value.values():
+                              if isinstance(child, (dict, list)):
+                                  yield from _walk_json_dicts(child, depth + 1)
                       elif isinstance(value, list):
-                          for item in value:
-                              candidate = _find_created_directory_id(item, depth + 1)
-                              if candidate:
-                                  return candidate
-                      return ""
+                          for child in value:
+                              if isinstance(child, (dict, list)):
+                                  yield from _walk_json_dicts(child, depth + 1)
 
-                  upload_directory_id = _find_created_directory_id(create_folder_payload)
+                  def _scalar_id(value):
+                      return isinstance(value, (str, int)) and str(value).strip() != ""
+
+                  upload_directory_id = ""
+                  folder_response_dicts = list(_walk_json_dicts(folder_create_payload))
+                  # Prefer an object explicitly named as the folder we just created.
+                  for item in folder_response_dicts:
+                      if str(item.get("name", "")).strip() == folder_name:
+                          for key in ("id", "directoryId", "folderId", "folder_id", "_id"):
+                              if _scalar_id(item.get(key)):
+                                  upload_directory_id = str(item[key]).strip()
+                                  break
+                      if upload_directory_id:
+                          break
+                  # Some API responses return only {"id": "..."} (or wrap it
+                  # in data/result), so accept an ID from the creation response.
                   if not upload_directory_id:
+                      preferred_containers = [folder_create_payload]
+                      for key in ("data", "result", "directory", "folder"):
+                          value = folder_create_payload.get(key)
+                          if isinstance(value, dict):
+                              preferred_containers.insert(0, value)
+                      for item in preferred_containers:
+                          for key in ("id", "directoryId", "folderId", "folder_id", "_id"):
+                              if _scalar_id(item.get(key)):
+                                  candidate = str(item[key]).strip()
+                                  if candidate != root_directory_id:
+                                      upload_directory_id = candidate
+                                      break
+                          if upload_directory_id:
+                              break
+                  if not upload_directory_id or upload_directory_id == root_directory_id:
                       raise RuntimeError(
-                          "FUCKINGFAST accepted the folder-creation request but did not return a usable folder ID. "
-                          "No file was uploaded and no replacement link was saved."
+                          "FUCKINGFAST created the upload directory but did not return its directory ID. "
+                          "Upload stopped safely; no alternate filename was generated. Response: "
+                          + json.dumps(folder_create_payload, ensure_ascii=False)[:900]
                       )
 
-                  # This iterator is used only after upload, to verify the file
-                  # inside the newly-created per-attempt folder. It is not used
-                  # to search for or reuse existing files before upload.
+                  print(
+                      f"::notice title=FUCKINGFAST Isolated Directory::Created {folder_name}; "
+                      "no account-wide filename duplicate scan was performed."
+                  )
+
                   def _walk_named_items(value, depth=0):
                       if depth > 10:
                           return
                       if isinstance(value, dict):
                           name = value.get("name") or value.get("filename")
-                          item_id = value.get("id") or value.get("_id") or value.get("fileId") or value.get("file_id")
+                          item_id = value.get("id") or value.get("fileId") or value.get("file_id")
                           item_type = str(value.get("type") or value.get("kind") or "").strip().casefold()
-                          is_directory = (
-                              value.get("isDirectory") is True
-                              or value.get("is_dir") is True
-                              or item_type in ("directory", "folder", "dir")
-                          )
-                          if isinstance(name, str) and _is_scalar_id(item_id) and not is_directory:
+                          is_directory = (value.get("isDirectory") is True) or (value.get("is_dir") is True) or item_type in ("directory", "folder", "dir")
+                          if isinstance(name, str) and _scalar_id(item_id) and not is_directory:
                               yield name, str(item_id).strip(), value
-                          for key in ("data", "files", "items", "children", "contents", "result"):
+                          for key in ("data", "files", "folders", "directories", "items", "children", "contents", "result"):
                               if key in value:
                                   yield from _walk_named_items(value[key], depth + 1)
                       elif isinstance(value, list):
                           for item in value:
                               yield from _walk_named_items(item, depth + 1)
 
-                  # Resolve the current location ID from FUCKINGFAST's public API.
-                  # The documented account-directory upload route is /{parentId}/{name}.
-                  # The parent is this job's fresh folder; the remote filename stays exact.
+                  # Resolve the selected storage location. The upload goes directly
+                  # into the unique directory created for this queue run; no move or
+                  # account-wide filename scan is needed.
                   update_progress("uploading", f"Resolving FUCKINGFAST {FUCKINGFAST_REGION} storage location.", file_name)
                   locations_response = requests.get(
                       "https://fuckingfast.net/api/locations",
@@ -1073,20 +1084,21 @@ jobs:
 
                   from urllib.parse import urlencode
                   encoded_name = quote(fuckingfast_upload_name, safe="")
-                  encoded_folder_id = quote(upload_directory_id, safe="")
+                  encoded_upload_directory_id = quote(upload_directory_id, safe="")
                   query = urlencode({"locationId": location_id})
-                  # Use the documented account-directory endpoint. The new
-                  # parent folder prevents same-name conflicts while preserving
-                  # the original normalized remote filename byte-for-byte.
-                  upload_url = f"https://w.fuckingfast.net/{encoded_folder_id}/{encoded_name}?{query}"
+                  # Upload directly into the authenticated account root. The
+                  # documented /{parentId}/{name} route avoids a second File
+                  # Manager move request, which currently returns HTTP 405.
+                  # Keep the selected storage location in the query string.
+                  upload_url = f"https://w.fuckingfast.net/{encoded_upload_directory_id}/{encoded_name}?{query}"
                   upload_label = fuckingfast_upload_name if fuckingfast_upload_name != file_name else file_name
-                  update_progress("uploading", f"Uploading {upload_label} ({file_size_gb} GiB) into your new FUCKINGFAST account folder · {FUCKINGFAST_REGION}.", file_name)
+                  update_progress("uploading", f"Uploading {upload_label} ({file_size_gb} GiB) into your FUCKINGFAST account · {FUCKINGFAST_REGION}.", file_name)
 
                   # Use FUCKINGFAST's documented cURL -T upload method rather
                   # than requests.put() with a custom streaming iterator. This
                   # avoids the requests/urllib3 TLS EOF failure seen on large
                   # uploads and lets curl retry a dropped upload connection.
-                  update_progress("uploading", f"Uploading {file_name} ({file_size_gb} GiB) into your new FUCKINGFAST account folder · {FUCKINGFAST_REGION}.", file_name)
+                  update_progress("uploading", f"Uploading {file_name} ({file_size_gb} GiB) into your FUCKINGFAST account · {FUCKINGFAST_REGION}.", file_name)
 
                   curl_config_path = ""
                   curl_response_path = ""
@@ -1121,7 +1133,7 @@ jobs:
                           upload_url,
                       ]
 
-                      print("::notice title=FUCKINGFAST Transport::Uploading the original remote filename into a fresh authenticated account folder with cURL; only transient connection/server failures are retried.")
+                      print("::notice title=FUCKINGFAST Transport::Uploading the original filename into this job’s isolated authenticated directory. cURL retries transient connection/server errors, not permanent HTTP 400 filename conflicts.")
                       curl_process = subprocess.Popen(
                           curl_command,
                           stdout=subprocess.PIPE,
@@ -1187,40 +1199,37 @@ jobs:
                       except OSError:
                           curl_response_text = ""
 
-                      # A retry can receive HTTP 400 "file already exists" when
-                      # the first PUT actually completed but its response was lost.
-                      # Do not decide success/failure from that response alone:
-                      # first inspect only this attempt's empty, newly-created
-                      # folder, then accept it only if the exact file and size exist.
-                      curl_transport_error = ""
                       if curl_return_code != 0:
                           useful_curl_errors = [
                               line for line in curl_stderr_lines
                               if any(token in line.casefold() for token in ("curl:", "error", "retry", "failed", "ssl", "timed out"))
                           ]
-                          curl_transport_error = "\n".join(useful_curl_errors[-12:])[-1600:]
-                          if not curl_transport_error:
-                              curl_transport_error = f"cURL exited with code {curl_return_code} without additional diagnostics."
+                          curl_error_detail = "\n".join(useful_curl_errors[-12:])[-1600:]
+                          if not curl_error_detail:
+                              curl_error_detail = f"cURL exited with code {curl_return_code} without additional diagnostics."
+                          raise RuntimeError(
+                              "FUCKINGFAST upload transport failed after automatic retries "
+                              f"(cURL exit {curl_return_code}). {curl_error_detail}"
+                          )
 
-                      upload_http_error = ""
                       if curl_http_status not in (200, 201):
-                          upload_http_error = (
-                              f"HTTP {curl_http_status}: {curl_response_text[:1200] or 'No response body'}"
+                          raise RuntimeError(
+                              f"Authenticated FUCKINGFAST account upload failed (HTTP {curl_http_status}): "
+                              f"{curl_response_text[:1200] or 'No response body'}"
                           )
 
                       try:
-                          upload_data = json.loads(curl_response_text) if curl_response_text.strip() else {}
+                          upload_data = json.loads(curl_response_text)
                       except ValueError:
                           # The API documentation does not specify a response schema.
-                          # Preserve a plain ID / HTTPS URL response when supplied.
+                          # Accept JSON objects as well as a plain ID / HTTPS URL response.
                           upload_data = {"raw": curl_response_text.strip()}
 
                       response_code = upload_data.get("code") if isinstance(upload_data, dict) else None
                       response_data = upload_data.get("data") if isinstance(upload_data, dict) and isinstance(upload_data.get("data"), dict) else upload_data
                       fuckingfast_file_id = ""
                       if isinstance(response_data, dict):
-                          # Do not treat a content hash as a File Manager file ID.
-                          for id_key in ("id", "fileId", "file_id"):
+                          for id_key in ("id", "fileId", "file_id", "hash"):
                               candidate_id = response_data.get(id_key)
                               if isinstance(candidate_id, (str, int)) and str(candidate_id).strip():
                                   fuckingfast_file_id = str(candidate_id).strip()
@@ -1244,89 +1253,92 @@ jobs:
                           elif len(raw_value) <= 500 and " " not in raw_value:
                               fuckingfast_file_id = raw_value
 
-                      # An HTTP/API error can still follow a completed PUT if
-                      # cURL retried after losing the first response. Defer the
-                      # verdict until the isolated folder is checked below.
-                      api_error_detail = ""
+                      # The developer page documents HTTP upload routes but not
+                      # their JSON response schema. Trust HTTP 200/201 above,
+                      # while still rejecting an explicit API-level failure.
                       if isinstance(upload_data, dict):
                           api_status = str(upload_data.get("status", "")).strip().casefold()
                           if upload_data.get("success") is False or api_status in ("error", "failed", "failure"):
-                              api_error_detail = f"FUCKINGFAST API response: {curl_response_text[:1200]}"
-                      # Verify only the file just uploaded into this job's new
-                      # directory. This is a post-upload integrity check, not a
-                      # duplicate search and never reuses an older account file.
+                              raise RuntimeError(
+                                  "FUCKINGFAST API reported an unsuccessful upload: "
+                                  f"{curl_response_text[:1200]}"
+                              )
+                      # The API response schema is not documented. The authenticated
+                      # File Manager lookup below is the final source of truth for the ID.
+
+                      # Verify only the directory created for this queue run.
+                      # This is post-upload verification, not a duplicate scan:
+                      # the folder was empty when created and isolated to this job.
                       account_file_id = ""
                       account_file_item = None
-                      verify_folder_url = f"https://fuckingfast.net/api/fs/{quote(upload_directory_id, safe='')}"
-                      for verify_attempt in range(1, 7):
-                          verify_folder_response = requests.get(
-                              verify_folder_url,
+                      expected_file_size = int(os.path.getsize(file_path))
+                      verify_directory_url = f"https://fuckingfast.net/api/fs/{quote(upload_directory_id, safe='')}"
+                      for verify_attempt in range(1, 5):
+                          verify_directory_response = requests.get(
+                              verify_directory_url,
                               headers=fuckingfast_auth_headers,
                               timeout=(20, 90),
                           )
-                          if verify_folder_response.status_code == 200:
-                              try:
-                                  verify_folder_payload = verify_folder_response.json()
-                              except ValueError as error:
-                                  raise RuntimeError("FUCKINGFAST returned invalid JSON during post-upload folder verification.") from error
-                              matching_items = [
-                                  (found_id, found_item)
-                                  for found_name, found_id, found_item in _walk_named_items(verify_folder_payload)
-                                  if found_name == fuckingfast_upload_name
-                              ]
-                              if matching_items:
-                                  if fuckingfast_file_id:
-                                      id_match = next((item for item in matching_items if item[0] == fuckingfast_file_id), None)
-                                      if id_match:
-                                          account_file_id, account_file_item = id_match
-                                      else:
-                                          raise RuntimeError(
-                                              "FUCKINGFAST upload response file ID does not match the file with the exact "
-                                              "remote filename inside the newly-created upload folder. The link was not saved."
-                                          )
-                                  else:
-                                      account_file_id, account_file_item = matching_items[0]
-                                  break
-                          elif verify_folder_response.status_code >= 500 and verify_attempt < 6:
-                              pass
-                          else:
+                          if verify_directory_response.status_code != 200:
                               raise RuntimeError(
-                                  "FUCKINGFAST post-upload folder verification failed "
-                                  f"(HTTP {verify_folder_response.status_code}): {verify_folder_response.text[:700]}"
+                                  "FUCKINGFAST post-upload directory verification failed "
+                                  f"(HTTP {verify_directory_response.status_code}): {verify_directory_response.text[:700]}"
                               )
-                          if verify_attempt < 6:
+                          try:
+                              verify_directory_payload = verify_directory_response.json()
+                          except ValueError as error:
+                              raise RuntimeError("FUCKINGFAST returned invalid JSON while verifying the isolated upload directory.") from error
+
+                          for found_name, found_id, found_item in _walk_named_items(verify_directory_payload):
+                              if found_name != fuckingfast_upload_name:
+                                  continue
+                              candidate_size = None
+                              if isinstance(found_item, dict):
+                                  for size_key in ("size", "fileSize", "file_size", "bytes"):
+                                      value = found_item.get(size_key)
+                                      if isinstance(value, (int, float)):
+                                          candidate_size = int(value)
+                                          break
+                                      if isinstance(value, str) and value.strip().isdigit():
+                                          candidate_size = int(value.strip())
+                                          break
+                              if candidate_size is not None and candidate_size != expected_file_size:
+                                  raise RuntimeError(
+                                      "FUCKINGFAST listed the uploaded filename but its stored size does not match "
+                                      f"the source file: expected {expected_file_size} bytes, received {candidate_size} bytes."
+                                  )
+                              account_file_id = found_id
+                              account_file_item = found_item
+                              break
+
+                          if account_file_id:
+                              break
+                          if verify_attempt < 4:
                               update_progress(
-                                  "uploading",
-                                  f"Upload received. Waiting for FUCKINGFAST to expose the new file in its own folder (verification {verify_attempt}/6).",
+                                  "checking_account",
+                                  f"Upload accepted; waiting for FUCKINGFAST to expose the file in its isolated directory (verification {verify_attempt}/4).",
                                   file_name,
                               )
-                              time.sleep(5)
+                              time.sleep(3)
 
-                      if not account_file_id or not isinstance(account_file_item, dict):
-                          detail_id = f" Upload response file ID: {fuckingfast_file_id}." if fuckingfast_file_id else " No usable upload file ID was returned."
-                          failure_details = " ".join(part for part in (upload_http_error, api_error_detail, curl_transport_error) if part)
+                      if not account_file_id:
+                          detail_id = f" Upload response file ID: {fuckingfast_file_id}." if fuckingfast_file_id else " The upload response did not include a usable file ID."
                           raise RuntimeError(
-                              "FUCKINGFAST did not expose the exact remote filename inside this attempt's new upload folder, "
-                              "so the upload cannot be verified and no replacement link was saved. "
-                              + (failure_details[:1400] + ". " if failure_details else "")
+                              "FUCKINGFAST accepted the upload request, but the exact original filename could not be "
+                              "verified in this job's isolated directory after 4 checks. The link was not saved and "
+                              "no alternate remote filename was generated."
                               + detail_id
                           )
 
-                      # The file-manager record in this isolated folder is the
-                      # authoritative file ID and size. Never substitute a
-                      # different filename or an older file from another folder.
+                      if fuckingfast_file_id and account_file_id != fuckingfast_file_id:
+                          print("::warning title=FUCKINGFAST File ID::The directory listing ID differs from the upload response; using the ID verified inside this job's isolated directory.")
                       fuckingfast_file_id = account_file_id
-                      # Prefer the URL attached to the exact File Manager record
-                      # verified in this isolated folder. Only fall back to the
-                      # upload response URL when the manager record has no URL.
-                      manager_verified_url = ""
-                      for item_url_key in ("url", "downloadUrl", "download_url", "downloadPage", "downloadPageUrl", "shareUrl", "share_url", "link"):
-                          candidate_item_url = account_file_item.get(item_url_key)
-                          if isinstance(candidate_item_url, str) and candidate_item_url.strip().startswith("https://"):
-                              manager_verified_url = candidate_item_url.strip()
-                              break
-                      if manager_verified_url:
-                          fuckingfast_returned_url = manager_verified_url
+                      if isinstance(account_file_item, dict) and not fuckingfast_returned_url:
+                          for item_url_key in ("url", "downloadUrl", "download_url", "downloadPage", "downloadPageUrl", "shareUrl", "share_url", "link"):
+                              candidate_item_url = account_file_item.get(item_url_key)
+                              if isinstance(candidate_item_url, str) and candidate_item_url.strip().startswith("https://"):
+                                  fuckingfast_returned_url = candidate_item_url.strip()
+                                  break
 
                       if fuckingfast_returned_url:
                           from urllib.parse import urlparse
@@ -1335,56 +1347,30 @@ jobs:
                               raise RuntimeError("FUCKINGFAST returned a URL outside the official HTTPS domain. Upload result was not saved.")
 
                       returned_name = str(response_data.get("name", "")).strip() if isinstance(response_data, dict) else ""
-                      if not returned_name:
-                          returned_name = str(account_file_item.get("name") or account_file_item.get("filename") or "").strip()
-                      if returned_name != fuckingfast_upload_name:
+                      if returned_name and returned_name != fuckingfast_upload_name:
                           raise RuntimeError(
-                              "FUCKINGFAST accepted the upload but the verified account record has an unexpected filename. "
-                              f"Expected '{fuckingfast_upload_name}', received '{returned_name or 'unknown'}'."
+                              "FUCKINGFAST accepted the upload but returned an unexpected filename. "
+                              f"Expected '{fuckingfast_upload_name}', received '{returned_name}'."
                           )
-
-                      def _read_verified_size(item):
-                          if not isinstance(item, dict):
-                              return None
-                          for size_key in ("size", "fileSize", "file_size", "sizeBytes", "size_bytes", "bytes"):
-                              value = item.get(size_key)
-                              if isinstance(value, (int, float)) and value >= 0:
-                                  return int(value)
-                              if isinstance(value, str) and value.strip().isdigit():
-                                  return int(value.strip())
-                          return None
-
-                      manager_size = _read_verified_size(account_file_item)
-                      response_size = _read_verified_size(response_data)
-                      verified_size = manager_size if manager_size is not None else response_size
-                      if verified_size is None:
-                          raise RuntimeError(
-                              "FUCKINGFAST did not expose a verifiable byte size for the newly uploaded file. "
-                              "The link was not saved because file integrity could not be confirmed."
-                          )
-                      if verified_size != int(os.path.getsize(file_path)):
-                          raise RuntimeError(
-                              "FUCKINGFAST uploaded file size does not match the source: "
-                              f"expected {os.path.getsize(file_path)} bytes, received {verified_size} bytes."
-                          )
-
+                      returned_size = response_data.get("size") if isinstance(response_data, dict) else None
+                      if returned_size is not None:
+                          try:
+                              if int(returned_size) != int(os.path.getsize(file_path)):
+                                  raise RuntimeError(
+                                      "FUCKINGFAST returned a file size that does not match the uploaded source: "
+                                      f"expected {os.path.getsize(file_path)} bytes, received {returned_size} bytes."
+                                  )
+                          except (TypeError, ValueError):
+                              print("::warning title=FUCKINGFAST Response::Could not parse returned file size; file ID was present and API success code was accepted.")
                       returned_location_id = str(response_data.get("locationId", "")).strip() if isinstance(response_data, dict) else ""
                       if returned_location_id and returned_location_id != location_id:
                           print(
                               f"::warning title=FUCKINGFAST Region::Requested location {location_id}, "
                               f"but API response reports {returned_location_id}. Check the file in FUCKINGFAST File Manager."
                           )
-                      if curl_transport_error or upload_http_error or api_error_detail:
-                          recovered_detail = upload_http_error or api_error_detail or curl_transport_error
-                          print(
-                              "::warning title=FUCKINGFAST Upload Reconciled::The upload response reported an error, "
-                              "but the exact filename and byte size were verified inside this attempt's new account folder. "
-                              f"Using the verified file. Original response: {recovered_detail[:900]}"
-                          )
                       print(
-                          f"::notice title=FUCKINGFAST Upload Verified::API code {response_code or curl_http_status}; "
-                          f"file ID {fuckingfast_file_id}; exact remote name {returned_name}; "
-                          f"verified size {verified_size} bytes; folder {upload_folder_name}."
+                          f"::notice title=FUCKINGFAST Upload Accepted::API code {response_code or curl_http_status}; "
+                          f"file ID {fuckingfast_file_id}; remote name {returned_name or fuckingfast_upload_name}."
                       )
                   finally:
                       for temporary_path in (curl_config_path, curl_response_path):
@@ -1395,66 +1381,60 @@ jobs:
                                   pass
 
                   result_url = fuckingfast_returned_url or f"https://fuckingfast.net/{quote(fuckingfast_file_id, safe='')}"
-                  # Probe the public share URL with a one-byte Range request.
-                  # Do not write a link back to WordPress unless the public URL
-                  # is reachable and does not return a known expiry/challenge page.
-                  public_probe_error = ""
-                  for public_probe_attempt in range(1, 4):
-                      try:
-                          with requests.get(
-                              result_url,
-                              headers={
-                                  "User-Agent": HEADERS["User-Agent"],
-                                  "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
-                                  "Range": "bytes=0-0",
-                              },
-                              stream=True,
-                              allow_redirects=True,
-                              timeout=(20, 60),
-                          ) as public_probe:
-                              probe_status = int(public_probe.status_code)
-                              if probe_status not in (200, 206):
-                                  public_probe_error = f"public URL returned HTTP {probe_status}"
-                              else:
-                                  probe_final_url = str(public_probe.url or "")
-                                  if not probe_final_url.startswith("https://"):
-                                      public_probe_error = "public URL redirected to a non-HTTPS address"
-                                  else:
-                                      probe_sample = next(public_probe.iter_content(chunk_size=4096), b"")
-                                      probe_text = probe_sample.decode("utf-8", errors="ignore").casefold()
-                                      dead_markers = (
-                                          "file not found", "file has expired", "file expired",
-                                          "file does not exist", "this file was deleted",
-                                          "file has been deleted", "no longer available",
-                                      )
-                                      challenge_markers = (
-                                          "just a moment", "attention required", "cf-chl-",
-                                          "challenge-platform", "cloudflare ray id",
-                                      )
-                                      if any(marker in probe_text for marker in dead_markers):
-                                          public_probe_error = "public URL page reports that the file is expired or unavailable"
-                                      elif any(marker in probe_text for marker in challenge_markers):
-                                          public_probe_error = "public URL returned a Cloudflare challenge instead of a verifiable share page"
-                                      elif not probe_sample:
-                                          public_probe_error = "public URL returned an empty response"
-                                      else:
-                                          public_probe_error = ""
-                          if not public_probe_error:
+                  from urllib.parse import urlparse
+                  parsed_public_url = urlparse(result_url)
+                  if parsed_public_url.scheme != "https" or not parsed_public_url.hostname or not (
+                      parsed_public_url.hostname == "fuckingfast.net" or parsed_public_url.hostname.endswith(".fuckingfast.net")
+                  ):
+                      raise RuntimeError("FUCKINGFAST did not produce an HTTPS public page URL on its official domain. No link was saved.")
+
+                  # Probe the page/byte-range endpoint before calling WordPress.
+                  # A 404/410 or an explicit unavailable-page body is never saved.
+                  with requests.get(
+                      result_url,
+                      headers={
+                          "User-Agent": HEADERS["User-Agent"],
+                          "Accept": "text/html,application/octet-stream;q=0.9,*/*;q=0.8",
+                          "Range": "bytes=0-4095",
+                      },
+                      stream=True,
+                      allow_redirects=True,
+                      timeout=(20, 60),
+                  ) as link_check_response:
+                      if link_check_response.status_code < 200 or link_check_response.status_code >= 400:
+                          raise RuntimeError(
+                              f"FUCKINGFAST public-link verification failed (HTTP {link_check_response.status_code}). "
+                              "The new URL was not saved to WordPress."
+                          )
+                      final_public_url = urlparse(link_check_response.url)
+                      if final_public_url.scheme != "https" or not final_public_url.hostname or not (
+                          final_public_url.hostname == "fuckingfast.net" or final_public_url.hostname.endswith(".fuckingfast.net")
+                      ):
+                          raise RuntimeError("FUCKINGFAST public link redirected outside its official HTTPS domain. The link was not saved.")
+                      link_preview = bytearray()
+                      for preview_chunk in link_check_response.iter_content(chunk_size=4096):
+                          if preview_chunk:
+                              link_preview.extend(preview_chunk[:4096])
+                          if len(link_preview) >= 16384:
                               break
-                      except requests.RequestException as probe_error:
-                          public_probe_error = str(probe_error)
-                      if public_probe_attempt < 3:
-                          time.sleep(8)
-                  if public_probe_error:
-                      raise RuntimeError(
-                          "FUCKINGFAST upload exists in the account folder, but the public download URL could not be "
-                          f"verified ({public_probe_error}). The new URL was not saved to WordPress."
+                      preview_text = bytes(link_preview).decode("utf-8", errors="ignore").casefold()
+                      unavailable_markers = (
+                          "file not found",
+                          "this file was deleted",
+                          "file has been deleted",
+                          "file does not exist",
+                          "file is unavailable",
+                          "this file is no longer available",
+                          "file has expired",
+                          "download not found",
+                          "404 not found",
                       )
+                      if any(marker in preview_text for marker in unavailable_markers):
+                          raise RuntimeError("FUCKINGFAST returned an unavailable/deleted-file page for the new upload. The link was not saved.")
 
                   message = (
                       f"FUCKINGFAST authenticated upload completed and verified in {FUCKINGFAST_REGION}. "
-                      f"Exact remote filename: {fuckingfast_upload_name}. File size: {file_size_gb} GiB. "
-                      f"Account folder: {upload_folder_name}."
+                      f"Remote filename (no generated suffix): {fuckingfast_upload_name}. File size: {file_size_gb} GiB."
                   )
 
               print(f"::notice title={PLATFORM.title()} Upload Complete::{result_url}")
