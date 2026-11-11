@@ -84,7 +84,7 @@ jobs:
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
           PROVIDER_CONFIG: ${{ github.event.client_payload.provider_config || github.event.client_payload.pixeldrain_api || '' }}
           FORCE_UPLOAD: ${{ github.event.client_payload.force_upload || 'no' }}
-          KEEPALIVE_PERCENT: ${{ github.event.client_payload.keepalive_percent || '15' }}
+          KEEPALIVE_PERCENT: ${{ github.event.client_payload.keepalive_percent || '100' }}
           GOFILE_API_TOKEN: ${{ github.event.client_payload.platform == 'gofile' && secrets.GOFILE_API_TOKEN || '' }}
           BUZZHEAVIER_ACCOUNT_ID: ${{ github.event.client_payload.platform == 'buzzheavier' && secrets.BUZZHEAVIER_ACCOUNT_ID || '' }}
           FUCKINGFAST_ACCOUNT_ID: ${{ github.event.client_payload.platform == 'fuckingfast' && secrets.FUCKINGFAST_ACCOUNT_ID || '' }}
@@ -95,6 +95,7 @@ jobs:
           import sys
           import time
           import traceback
+          import hashlib
           import requests
           import gdown
           import json
@@ -117,11 +118,8 @@ jobs:
           BUZZHEAVIER_REGION = PROVIDER_CONFIG if PLATFORM == "buzzheavier" and PROVIDER_CONFIG else "Asia-Pacific"
           FUCKINGFAST_REGION = PROVIDER_CONFIG if PLATFORM == "fuckingfast" and PROVIDER_CONFIG else "Asia-Pacific"
           FORCE_UPLOAD = os.environ.get("FORCE_UPLOAD", "no").strip().lower() == "yes"
-          try:
-              KEEPALIVE_PERCENT = int(os.environ.get("KEEPALIVE_PERCENT", "15").strip() or "15")
-          except (TypeError, ValueError):
-              KEEPALIVE_PERCENT = 15
-          KEEPALIVE_PERCENT = max(11, min(100, KEEPALIVE_PERCENT))
+          # Kept as a compatibility value only: every Keep-Alive now downloads 100% of the file.
+          KEEPALIVE_PERCENT = 100
           GOFILE_API_TOKEN = os.environ.get("GOFILE_API_TOKEN", "").strip()
           BUZZHEAVIER_ACCOUNT_ID = os.environ.get("BUZZHEAVIER_ACCOUNT_ID", "").strip()
           FUCKINGFAST_ACCOUNT_ID = os.environ.get("FUCKINGFAST_ACCOUNT_ID", "").strip()
@@ -600,14 +598,20 @@ jobs:
               return "", ""
 
 
-          def fetch_pixeldrain_file_info(file_id):
-              """Fetch authoritative Pixeldrain metadata for one existing file."""
+          def fetch_pixeldrain_file_info(file_id, session=None):
+              """Fetch authoritative Pixeldrain metadata, bypassing stale HTTP caches."""
               info_url = f"https://pixeldrain.com/api/file/{quote(file_id, safe='')}/info"
               auth = ("", PIXELDRAIN_API) if PIXELDRAIN_API else None
-              response = requests.get(
+              requester = session if session is not None else requests
+              response = requester.get(
                   info_url,
                   auth=auth,
-                  headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"},
+                  headers={
+                      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                      "Accept": "application/json",
+                      "Cache-Control": "no-cache",
+                      "Pragma": "no-cache",
+                  },
                   timeout=(20, 90),
               )
               if response.status_code != 200:
@@ -632,100 +636,177 @@ jobs:
               return data
 
           def perform_pixeldrain_keepalive(file_id):
-              """Transfer only the configured qualifying percentage in one GET request."""
+              """Fully download one Pixeldrain file, verify its size/SHA-256, and inspect server counters."""
               info_before = fetch_pixeldrain_file_info(file_id)
               file_size = int(info_before["size"])
               file_name = _safe_local_filename(info_before.get("name")) or f"Pixeldrain-{file_id}"
-              requested_bytes = (file_size * KEEPALIVE_PERCENT + 99) // 100
-              # Pixeldrain requires strictly more than 10% in one request.
-              qualifying_floor = (file_size // 10) + 1
-              target_bytes = min(file_size, max(requested_bytes, qualifying_floor))
-              if target_bytes <= file_size // 10:
-                  raise RuntimeError("The requested Keep-Alive transfer would not exceed Pixeldrain's 10% minimum.")
+              expected_sha256 = str(info_before.get("hash_sha256") or "").strip().lower()
+              if not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
+                  raise RuntimeError("Pixeldrain did not provide a valid SHA-256 checksum for this file. Full-download verification cannot safely continue.")
 
+              downloads_before = max(0, int(info_before.get("downloads", 0) or 0))
+              bandwidth_before = max(0, int(info_before.get("bandwidth_used", 0) or 0))
+              views_before = max(0, int(info_before.get("views", 0) or 0))
+              viewer_url = f"https://pixeldrain.com/u/{quote(file_id, safe='')}"
               file_url = f"https://pixeldrain.com/api/file/{quote(file_id, safe='')}?download"
               auth = ("", PIXELDRAIN_API) if PIXELDRAIN_API else None
-              download_headers = {"User-Agent": HEADERS["User-Agent"], "Accept": "*/*"}
+              browser_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
               downloaded_bytes = 0
               last_progress_bytes = 0
-              last_progress_time = 0.0
+              last_progress_time = time.time()
+              digest = hashlib.sha256()
+
               update_progress(
                   "starting",
-                  f"Pixeldrain Keep-Alive: preparing a {KEEPALIVE_PERCENT}% qualifying transfer for {file_name}.",
+                  f"Pixeldrain Keep-Alive: opening the file page, then downloading the complete {file_size:,}-byte file.",
                   file_name,
               )
 
-              with requests.get(
-                  file_url,
-                  auth=auth,
-                  headers=download_headers,
-                  stream=True,
-                  allow_redirects=True,
-                  timeout=(30, 300),
-              ) as response:
-                  if response.status_code != 200:
-                      detail = response.text[:700] if response.text else "No response body"
-                      raise RuntimeError(f"Pixeldrain file download failed (HTTP {response.status_code}): {detail}")
-                  if urlparse(response.url).scheme.lower() != "https":
-                      raise RuntimeError("Pixeldrain redirected the download to a non-HTTPS URL; the transfer was blocked.")
+              # Visit the normal Pixeldrain viewer first and keep its cookies. The
+              # subsequent file request carries this page as Referer. This is a
+              # normal navigation sequence, not a CAPTCHA or hotlink restriction bypass.
+              with requests.Session() as session:
+                  page_response = session.get(
+                      viewer_url,
+                      headers={
+                          "User-Agent": browser_ua,
+                          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                          "Accept-Language": "en-US,en;q=0.9",
+                          "Cache-Control": "no-cache",
+                      },
+                      allow_redirects=True,
+                      timeout=(20, 90),
+                  )
+                  if page_response.status_code != 200:
+                      detail = page_response.text[:500] if page_response.text else "No response body"
+                      raise RuntimeError(f"Pixeldrain file page could not be opened (HTTP {page_response.status_code}): {detail}")
+                  if urlparse(page_response.url).scheme.lower() != "https":
+                      raise RuntimeError("Pixeldrain file page redirected to a non-HTTPS URL; download blocked.")
+                  referer_url = page_response.url
+                  page_response.close()
 
-                  content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
-                  if content_type in ("text/html", "application/json", "application/problem+json"):
-                      raise RuntimeError(f"Pixeldrain returned {content_type} instead of the file. The file may require a CAPTCHA or may be unavailable.")
+                  download_headers = {
+                      "User-Agent": browser_ua,
+                      "Accept": "*/*",
+                      "Accept-Encoding": "identity",
+                      "Accept-Language": "en-US,en;q=0.9",
+                      "Referer": referer_url,
+                      "Cache-Control": "no-cache",
+                  }
+                  update_progress(
+                      "downloading",
+                      "Pixeldrain Keep-Alive: downloading 100% of the original file in one uninterrupted request.",
+                      file_name,
+                  )
+
                   try:
-                      content_length = int(response.headers.get("Content-Length", "0") or 0)
-                  except (TypeError, ValueError):
-                      content_length = 0
-                  if content_length > 0 and content_length < target_bytes:
-                      raise RuntimeError(f"Pixeldrain response is shorter than the qualifying target ({content_length} < {target_bytes} bytes).")
+                      with session.get(
+                          file_url,
+                          auth=auth,
+                          headers=download_headers,
+                          stream=True,
+                          allow_redirects=True,
+                          timeout=(30, 600),
+                      ) as response:
+                          if response.status_code != 200:
+                              detail = response.text[:900] if response.text else "No response body"
+                              try:
+                                  error_data = response.json()
+                                  if isinstance(error_data, dict):
+                                      detail = f"{error_data.get('value', 'download_error')}: {error_data.get('message', detail)}"
+                              except Exception:
+                                  pass
+                              raise RuntimeError(f"Pixeldrain full-file download failed (HTTP {response.status_code}): {detail}")
+                          if urlparse(response.url).scheme.lower() != "https":
+                              raise RuntimeError("Pixeldrain redirected the file download to a non-HTTPS URL; transfer blocked.")
+                          if response.headers.get("Content-Range"):
+                              raise RuntimeError("Pixeldrain returned a partial Content-Range response; a complete 200 OK file response is required.")
 
-                  chunks = iter(response.iter_content(chunk_size=1024 * 1024))
-                  first_chunk = next(chunks, b"")
-                  preview = (first_chunk or b"").lstrip()[:160].lower()
-                  error_document = preview.startswith((
-                      b"<!doctype html", b"<html", b'{"error"', b'{"success":false', b'{"value":"file_'
-                  ))
-                  if not first_chunk or error_document:
-                      raise RuntimeError("Pixeldrain returned an empty file or an API/error document instead of file data.")
+                          try:
+                              content_length = int(response.headers.get("Content-Length", "0") or 0)
+                          except (TypeError, ValueError):
+                              content_length = 0
+                          if content_length > 0 and content_length != file_size:
+                              raise RuntimeError(f"Pixeldrain Content-Length does not match the source file size ({content_length} != {file_size}).")
 
-                  downloaded_bytes = len(first_chunk)
-                  last_progress_bytes = downloaded_bytes
-                  last_progress_time = time.time()
-                  if downloaded_bytes < target_bytes:
-                      for chunk in chunks:
-                          if not chunk:
-                              continue
-                          downloaded_bytes += len(chunk)
-                          now = time.time()
-                          if downloaded_bytes - last_progress_bytes >= 64 * 1024 * 1024 or now - last_progress_time >= 30:
-                              last_progress_bytes = downloaded_bytes
-                              last_progress_time = now
-                              percent_done = min(99, int(downloaded_bytes * 100 / file_size))
-                              update_progress(
-                                  "downloading",
-                                  f"Pixeldrain Keep-Alive: {percent_done}% of the file received ({downloaded_bytes / (1024 ** 2):.0f} MiB).",
-                                  file_name,
-                              )
-                          if downloaded_bytes >= target_bytes:
-                              break
+                          for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
+                              if not chunk:
+                                  continue
+                              downloaded_bytes += len(chunk)
+                              digest.update(chunk)
+                              now = time.time()
+                              if downloaded_bytes - last_progress_bytes >= 64 * 1024 * 1024 or now - last_progress_time >= 30:
+                                  last_progress_bytes = downloaded_bytes
+                                  last_progress_time = now
+                                  percent_done = min(99, int(downloaded_bytes * 100 / file_size))
+                                  update_progress(
+                                      "downloading",
+                                      f"Pixeldrain Keep-Alive: {percent_done}% received ({downloaded_bytes:,} / {file_size:,} bytes).",
+                                      file_name,
+                                  )
+                  except requests.RequestException as error:
+                      raise RuntimeError(f"Pixeldrain full-file stream was interrupted before completion: {error}") from error
 
-              if downloaded_bytes < target_bytes:
-                  raise RuntimeError(f"Pixeldrain transfer ended early: needed {target_bytes} bytes but received {downloaded_bytes} bytes.")
-              actual_percent = round(downloaded_bytes * 100.0 / file_size, 2)
+              if downloaded_bytes != file_size:
+                  raise RuntimeError(f"Pixeldrain full-file download was incomplete: received {downloaded_bytes:,} of {file_size:,} bytes.")
+              actual_sha256 = digest.hexdigest().lower()
+              if actual_sha256 != expected_sha256:
+                  raise RuntimeError(f"Pixeldrain full-file SHA-256 verification failed for {file_name}; the downloaded bytes do not match the source file.")
 
-              # A post-transfer metadata refresh is best-effort; the byte threshold above
-              # is the success condition, while WordPress will also refresh account stats.
+              # Refresh Pixeldrain's own statistics after the body reached EOF and
+              # the full file passed size + SHA-256 verification. The downloads
+              # field is unique per downloader IP, so it may legitimately stay
+              # unchanged when this runner IP has already downloaded this file.
+              update_progress("verifying", "The complete file was received. Verifying Pixeldrain's live download and bandwidth counters.", file_name)
               info_after = info_before
-              try:
-                  info_after = fetch_pixeldrain_file_info(file_id)
-              except Exception as info_error:
-                  print(f"::warning title=Pixeldrain Keep-Alive Metadata::{info_error}")
+              metadata_after_available = False
+              for attempt in range(4):
+                  try:
+                      info_after = fetch_pixeldrain_file_info(file_id)
+                      metadata_after_available = True
+                      downloads_after = max(0, int(info_after.get("downloads", 0) or 0))
+                      bandwidth_after = max(0, int(info_after.get("bandwidth_used", 0) or 0))
+                      if downloads_after > downloads_before or (bandwidth_after - bandwidth_before) >= file_size:
+                          break
+                  except Exception as info_error:
+                      print(f"::warning title=Pixeldrain Counter Verification::{info_error}")
+                  if attempt < 3:
+                      time.sleep(2)
+
+              downloads_after = max(0, int(info_after.get("downloads", downloads_before) or 0))
+              bandwidth_after = max(0, int(info_after.get("bandwidth_used", bandwidth_before) or 0))
+              views_after = max(0, int(info_after.get("views", views_before) or 0))
+              counter_incremented = downloads_after > downloads_before
+              bandwidth_delta = max(0, bandwidth_after - bandwidth_before)
+              actual_percent = 100.0
+
+              counter_note = ""
+              if counter_incremented:
+                  counter_note = f"Pixeldrain unique-download counter increased from {downloads_before} to {downloads_after}."
+                  print(f"::notice title=Pixeldrain Download Counter::{counter_note}")
+              elif bandwidth_delta >= file_size:
+                  counter_note = (
+                      f"Pixeldrain confirmed at least {bandwidth_delta:,} additional bandwidth bytes. "
+                      f"Its unique-download counter stayed at {downloads_after}; Pixeldrain counts downloads once per downloader IP, "
+                      "so an IP already counted for this file will not add another unique download."
+                  )
+                  print(f"::notice title=Pixeldrain Unique Counter Unchanged::{counter_note}")
+              elif metadata_after_available:
+                  counter_note = (
+                      f"The full file was received and hash-verified, but Pixeldrain's API counters have not yet reflected this transfer "
+                      f"(downloads {downloads_before} → {downloads_after}; bandwidth delta {bandwidth_delta:,} bytes). "
+                      "The downloads statistic is unique per downloader IP and may not increase for an IP already counted."
+                  )
+                  print(f"::warning title=Pixeldrain Counter Not Reflected::{counter_note}")
+              else:
+                  counter_note = "The full file was received and hash-verified, but Pixeldrain's post-download statistics could not be fetched."
+                  print(f"::warning title=Pixeldrain Counter Verification::{counter_note}")
 
               result_url = f"https://pixeldrain.com/u/{quote(file_id, safe='')}"
               message = (
-                  f"Pixeldrain Keep-Alive transfer completed: {downloaded_bytes:,} of {file_size:,} bytes "
-                  f"({actual_percent:.2f}%) received in one request. Configured target: {KEEPALIVE_PERCENT}%. "
-                  "Pixeldrain's expiry refresh is limited to once per 24 hours."
+                  f"Pixeldrain FULL-FILE Keep-Alive verified: {downloaded_bytes:,} of {file_size:,} bytes received (100%). "
+                  f"SHA-256 matched: {actual_sha256}. {counter_note} "
+                  "Pixeldrain's expiry extension is limited to once per 24 hours."
               )
               return {
                   "file_name": file_name,
@@ -733,6 +814,16 @@ jobs:
                   "downloaded_bytes": downloaded_bytes,
                   "actual_percent": actual_percent,
                   "file_size": file_size,
+                  "sha256": actual_sha256,
+                  "hash_verified": True,
+                  "full_file_confirmed": True,
+                  "downloads_before": downloads_before,
+                  "downloads_after": downloads_after,
+                  "counter_incremented": counter_incremented,
+                  "bandwidth_before": bandwidth_before,
+                  "bandwidth_after": bandwidth_after,
+                  "bandwidth_delta": bandwidth_delta,
+                  "metadata_after_available": metadata_after_available,
                   "info": info_after,
                   "message": message,
               }
@@ -783,6 +874,14 @@ jobs:
                           "keepalive_pd_id": keepalive_file_id,
                           "keepalive_bytes": keepalive_result["downloaded_bytes"],
                           "keepalive_percent": keepalive_result["actual_percent"],
+                          "keepalive_full_file": keepalive_result["full_file_confirmed"],
+                          "keepalive_hash_verified": keepalive_result["hash_verified"],
+                          "keepalive_sha256": keepalive_result["sha256"],
+                          "keepalive_downloads_before": keepalive_result["downloads_before"],
+                          "keepalive_downloads_after": keepalive_result["downloads_after"],
+                          "keepalive_counter_incremented": keepalive_result["counter_incremented"],
+                          "keepalive_bandwidth_before": keepalive_result["bandwidth_before"],
+                          "keepalive_bandwidth_after": keepalive_result["bandwidth_after"],
                           "pd_downloads": max(0, int(info.get("downloads", 0) or 0)),
                           "pd_views": max(0, int(info.get("views", 0) or 0)),
                           "pd_bandwidth_used": max(0, int(info.get("bandwidth_used", 0) or 0)),
