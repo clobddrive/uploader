@@ -1308,24 +1308,53 @@ jobs:
                       buzz_file_id = verified_file[0]
                       if verified_file[2] is None and response_size is None:
                           raise RuntimeError("BUZZHEAVIER File Manager did not expose a stored size, so the upload could not be fully verified. The link was not saved.")
+                      # The authenticated File Manager check above is the authoritative
+                      # upload verification: it confirms this exact file ID, filename,
+                      # and byte size inside this job's isolated directory. The public
+                      # landing page may return HTTP 403 to GitHub-hosted runners (edge
+                      # protection / automated-request filtering), even when the stored
+                      # file exists. Therefore a 403 is inconclusive, not an upload error.
+                      # Keep the canonical public file-page URL unchanged.
                       result_url = f"https://buzzheavier.com/{quote(buzz_file_id, safe='')}"
-                      with requests.get(result_url, headers=browser_headers, stream=True, allow_redirects=True, timeout=(20, 60)) as public_response:
-                          if public_response.status_code not in (200, 206):
-                              raise RuntimeError(f"BUZZHEAVIER public link verification failed (HTTP {public_response.status_code}); the URL was not saved.")
-                          final_public_url = urlparse(public_response.url)
-                          if final_public_url.scheme != "https":
-                              raise RuntimeError("BUZZHEAVIER public link redirected to a non-HTTPS URL; the URL was not saved.")
-                          public_preview = bytearray()
-                          for chunk in public_response.iter_content(chunk_size=4096):
-                              if chunk:
-                                  public_preview.extend(chunk[:4096])
-                              if len(public_preview) >= 8192:
-                                  break
-                          public_preview_text = bytes(public_preview).decode("utf-8", errors="ignore").casefold()
-                          if any(marker in public_preview_text for marker in ("file not found", "this file was deleted", "file is unavailable", "file has expired", "404 not found")):
-                              raise RuntimeError("BUZZHEAVIER public page reports that the new file is unavailable; the URL was not saved.")
+                      public_check_note = ""
+                      try:
+                          with requests.get(
+                              result_url,
+                              headers=browser_headers,
+                              stream=True,
+                              allow_redirects=True,
+                              timeout=(20, 60),
+                          ) as public_response:
+                              public_status = public_response.status_code
+                              if public_status in (200, 206):
+                                  final_public_url = urlparse(public_response.url)
+                                  if final_public_url.scheme != "https":
+                                      raise RuntimeError("BUZZHEAVIER public link redirected to a non-HTTPS URL; refusing to save it.")
+                                  public_preview = bytearray()
+                                  for chunk in public_response.iter_content(chunk_size=4096):
+                                      if chunk:
+                                          public_preview.extend(chunk[:4096])
+                                      if len(public_preview) >= 8192:
+                                          break
+                                  public_preview_text = bytes(public_preview).decode("utf-8", errors="ignore").casefold()
+                                  if any(marker in public_preview_text for marker in ("file not found", "this file was deleted", "file is unavailable", "file has expired", "404 not found")):
+                                      raise RuntimeError("BUZZHEAVIER public page reports that the uploaded file is unavailable; the URL was not saved.")
+                                  public_check_note = f"Public landing-page check returned HTTP {public_status}."
+                              elif public_status == 403:
+                                  public_check_note = "Public landing-page check returned HTTP 403 from the provider edge; treated as inconclusive because authenticated File Manager verification already confirmed the exact file ID, filename, and byte size."
+                                  print(f"::warning title=BUZZHEAVIER Public Check Inconclusive::{public_check_note} Saving the canonical file URL based on authenticated metadata verification.")
+                              elif public_status in (408, 425, 429, 500, 502, 503, 504):
+                                  public_check_note = f"Public landing-page check was temporarily unavailable (HTTP {public_status}); authenticated File Manager verification confirmed the stored file."
+                                  print(f"::warning title=BUZZHEAVIER Public Check Deferred::{public_check_note} Saving the canonical file URL based on authenticated metadata verification.")
+                              elif public_status in (404, 410):
+                                  raise RuntimeError(f"BUZZHEAVIER public page reports HTTP {public_status}; the file may not be publicly available. The URL was not saved.")
+                              else:
+                                  raise RuntimeError(f"BUZZHEAVIER public link check returned unexpected HTTP {public_status}; the URL was not saved.")
+                      except requests.RequestException as public_error:
+                          public_check_note = f"Public landing-page check could not be completed ({public_error}); authenticated File Manager verification confirmed the stored file."
+                          print(f"::warning title=BUZZHEAVIER Public Check Deferred::{public_check_note} Saving the canonical file URL based on authenticated metadata verification.")
 
-                      message = f"BUZZHEAVIER authenticated upload verified in {BUZZHEAVIER_REGION}: exact original filename and {file_size} bytes. Isolated directory {folder_name}; upload attempt {buzz_attempt}/5."
+                      message = f"BUZZHEAVIER authenticated upload verified in {BUZZHEAVIER_REGION}: exact original filename and {file_size} bytes. Isolated directory {folder_name}; upload attempt {buzz_attempt}/5. {public_check_note}"
                       buzz_completed = True
                       print(f"::notice title=BUZZHEAVIER Upload Verified::File ID {buzz_file_id}; exact filename preserved: {file_name}.")
                       break
