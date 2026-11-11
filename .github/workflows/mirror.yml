@@ -700,9 +700,13 @@ jobs:
                   )
 
                   try:
+                      # Keep the file-content request anonymous. The API key is
+                      # used only for private metadata/account calls above; sending
+                      # it with the actual file GET can classify the transfer as an
+                      # authenticated owner download instead of a public visitor
+                      # download. Preserve the viewer-page cookies and Referer.
                       with session.get(
                           file_url,
-                          auth=auth,
                           headers=download_headers,
                           stream=True,
                           allow_redirects=True,
@@ -753,25 +757,36 @@ jobs:
               if actual_sha256 != expected_sha256:
                   raise RuntimeError(f"Pixeldrain full-file SHA-256 verification failed for {file_name}; the downloaded bytes do not match the source file.")
 
-              # Refresh Pixeldrain's own statistics after the body reached EOF and
-              # the full file passed size + SHA-256 verification. The downloads
-              # field is unique per downloader IP, so it may legitimately stay
-              # unchanged when this runner IP has already downloaded this file.
-              update_progress("verifying", "The complete file was received. Verifying Pixeldrain's live download and bandwidth counters.", file_name)
+              # Confirm that Pixeldrain itself recorded this as a qualifying
+              # transfer. A full body received by GitHub alone does not prove that
+              # Pixeldrain's expiry-refresh accounting accepted the request.
+              # "downloads" is unique per IP, so allow the alternative proof that
+              # bandwidth_used increased by more than 10% of this file's size.
+              min_expiry_bandwidth_delta = (file_size // 10) + 1
+              update_progress(
+                  "verifying",
+                  "The complete file passed SHA-256. Waiting for Pixeldrain to record the download/bandwidth activity.",
+                  file_name,
+              )
               info_after = info_before
               metadata_after_available = False
-              for attempt in range(4):
+              downloads_after = downloads_before
+              bandwidth_after = bandwidth_before
+              # Pixeldrain statistics may be updated asynchronously. Poll for up
+              # to about one minute before deciding whether this was recorded.
+              for attempt in range(12):
                   try:
                       info_after = fetch_pixeldrain_file_info(file_id)
                       metadata_after_available = True
                       downloads_after = max(0, int(info_after.get("downloads", 0) or 0))
                       bandwidth_after = max(0, int(info_after.get("bandwidth_used", 0) or 0))
-                      if downloads_after > downloads_before or (bandwidth_after - bandwidth_before) >= file_size:
+                      bandwidth_delta = max(0, bandwidth_after - bandwidth_before)
+                      if downloads_after > downloads_before or bandwidth_delta >= min_expiry_bandwidth_delta:
                           break
                   except Exception as info_error:
                       print(f"::warning title=Pixeldrain Counter Verification::{info_error}")
-                  if attempt < 3:
-                      time.sleep(2)
+                  if attempt < 11:
+                      time.sleep(5)
 
               downloads_after = max(0, int(info_after.get("downloads", downloads_before) or 0))
               bandwidth_after = max(0, int(info_after.get("bandwidth_used", bandwidth_before) or 0))
@@ -780,27 +795,29 @@ jobs:
               bandwidth_delta = max(0, bandwidth_after - bandwidth_before)
               actual_percent = 100.0
 
-              counter_note = ""
               if counter_incremented:
-                  counter_note = f"Pixeldrain unique-download counter increased from {downloads_before} to {downloads_after}."
+                  counter_note = f"Pixeldrain recorded the download: unique downloads {downloads_before} → {downloads_after}."
                   print(f"::notice title=Pixeldrain Download Counter::{counter_note}")
-              elif bandwidth_delta >= file_size:
+              elif bandwidth_delta >= min_expiry_bandwidth_delta:
                   counter_note = (
-                      f"Pixeldrain confirmed at least {bandwidth_delta:,} additional bandwidth bytes. "
-                      f"Its unique-download counter stayed at {downloads_after}; Pixeldrain counts downloads once per downloader IP, "
-                      "so an IP already counted for this file will not add another unique download."
+                      f"Pixeldrain recorded the transfer in bandwidth_used (+{bandwidth_delta:,} bytes); "
+                      f"the unique-IP downloads counter remained {downloads_after}."
                   )
-                  print(f"::notice title=Pixeldrain Unique Counter Unchanged::{counter_note}")
-              elif metadata_after_available:
-                  counter_note = (
-                      f"The full file was received and hash-verified, but Pixeldrain's API counters have not yet reflected this transfer "
-                      f"(downloads {downloads_before} → {downloads_after}; bandwidth delta {bandwidth_delta:,} bytes). "
-                      "The downloads statistic is unique per downloader IP and may not increase for an IP already counted."
+                  print(f"::notice title=Pixeldrain Bandwidth Counter::{counter_note}")
+              elif not metadata_after_available:
+                  raise RuntimeError(
+                      "The full file was received and SHA-256 verified, but Pixeldrain's post-download file-info API "
+                      "could not be read. Keep-Alive was NOT marked successful because server-side activity was not confirmed."
                   )
-                  print(f"::warning title=Pixeldrain Counter Not Reflected::{counter_note}")
               else:
-                  counter_note = "The full file was received and hash-verified, but Pixeldrain's post-download statistics could not be fetched."
-                  print(f"::warning title=Pixeldrain Counter Verification::{counter_note}")
+                  raise RuntimeError(
+                      "The full file was received and SHA-256 verified, but Pixeldrain recorded no download or bandwidth "
+                      f"increase after the transfer (downloads {downloads_before} → {downloads_after}; "
+                      f"bandwidth delta {bandwidth_delta:,} bytes; required bandwidth increase: "
+                      f"at least {min_expiry_bandwidth_delta:,} bytes). Keep-Alive was NOT marked successful. "
+                      "The API key is no longer sent with the file-content request; the request uses the normal viewer "
+                      "session and may still be blocked or uncounted by Pixeldrain's own hotlink/rate-limit policy."
+                  )
 
               result_url = f"https://pixeldrain.com/u/{quote(file_id, safe='')}"
               message = (
@@ -823,6 +840,8 @@ jobs:
                   "bandwidth_before": bandwidth_before,
                   "bandwidth_after": bandwidth_after,
                   "bandwidth_delta": bandwidth_delta,
+                  "min_expiry_bandwidth_delta": min_expiry_bandwidth_delta,
+                  "accounting_verified": True,
                   "metadata_after_available": metadata_after_available,
                   "info": info_after,
                   "message": message,
@@ -882,6 +901,8 @@ jobs:
                           "keepalive_counter_incremented": keepalive_result["counter_incremented"],
                           "keepalive_bandwidth_before": keepalive_result["bandwidth_before"],
                           "keepalive_bandwidth_after": keepalive_result["bandwidth_after"],
+                          "keepalive_accounting_verified": keepalive_result["accounting_verified"],
+                          "keepalive_min_expiry_bandwidth_delta": keepalive_result["min_expiry_bandwidth_delta"],
                           "pd_downloads": max(0, int(info.get("downloads", 0) or 0)),
                           "pd_views": max(0, int(info.get("views", 0) or 0)),
                           "pd_bandwidth_used": max(0, int(info.get("bandwidth_used", 0) or 0)),
@@ -2056,4 +2077,5 @@ jobs:
               except Exception as error:
                   print(f"::error::Could not send fallback callback to WordPress: {error}")
           PY
+
 
