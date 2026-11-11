@@ -84,6 +84,7 @@ jobs:
           WEBHOOK_SECRET: ${{ github.event.client_payload.webhook_secret }}
           PROVIDER_CONFIG: ${{ github.event.client_payload.provider_config || github.event.client_payload.pixeldrain_api || '' }}
           FORCE_UPLOAD: ${{ github.event.client_payload.force_upload || 'no' }}
+          KEEPALIVE_PERCENT: ${{ github.event.client_payload.keepalive_percent || '15' }}
           GOFILE_API_TOKEN: ${{ github.event.client_payload.platform == 'gofile' && secrets.GOFILE_API_TOKEN || '' }}
           BUZZHEAVIER_ACCOUNT_ID: ${{ github.event.client_payload.platform == 'buzzheavier' && secrets.BUZZHEAVIER_ACCOUNT_ID || '' }}
           FUCKINGFAST_ACCOUNT_ID: ${{ github.event.client_payload.platform == 'fuckingfast' && secrets.FUCKINGFAST_ACCOUNT_ID || '' }}
@@ -100,7 +101,7 @@ jobs:
           import re
           import subprocess
           import tempfile
-          from urllib.parse import quote, unquote
+          from urllib.parse import quote, unquote, urlparse
           from email.message import Message
 
           JOB_ID = os.environ.get("JOB_ID", "").strip()
@@ -112,10 +113,15 @@ jobs:
           DUPLICATE_CHECK_URL = os.environ.get("DUPLICATE_CHECK_URL", "").strip()
           WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
           PROVIDER_CONFIG = os.environ.get("PROVIDER_CONFIG", "").strip()
-          PIXELDRAIN_API = PROVIDER_CONFIG if PLATFORM == "pixeldrain" else ""
+          PIXELDRAIN_API = PROVIDER_CONFIG if PLATFORM in ("pixeldrain", "pixeldrain_keepalive") else ""
           BUZZHEAVIER_REGION = PROVIDER_CONFIG if PLATFORM == "buzzheavier" and PROVIDER_CONFIG else "Asia-Pacific"
           FUCKINGFAST_REGION = PROVIDER_CONFIG if PLATFORM == "fuckingfast" and PROVIDER_CONFIG else "Asia-Pacific"
           FORCE_UPLOAD = os.environ.get("FORCE_UPLOAD", "no").strip().lower() == "yes"
+          try:
+              KEEPALIVE_PERCENT = int(os.environ.get("KEEPALIVE_PERCENT", "15").strip() or "15")
+          except (TypeError, ValueError):
+              KEEPALIVE_PERCENT = 15
+          KEEPALIVE_PERCENT = max(11, min(100, KEEPALIVE_PERCENT))
           GOFILE_API_TOKEN = os.environ.get("GOFILE_API_TOKEN", "").strip()
           BUZZHEAVIER_ACCOUNT_ID = os.environ.get("BUZZHEAVIER_ACCOUNT_ID", "").strip()
           FUCKINGFAST_ACCOUNT_ID = os.environ.get("FUCKINGFAST_ACCOUNT_ID", "").strip()
@@ -147,7 +153,7 @@ jobs:
               except Exception as error:
                   print(f"::warning title=Queue Progress Update::{error}")
 
-          def send_final_result(result_status, file_name="", result_url="", message=""):
+          def send_final_result(result_status, file_name="", result_url="", message="", extra_fields=None):
               if not CALLBACK_URL or not WEBHOOK_SECRET:
                   raise RuntimeError("WordPress callback URL or webhook secret is missing.")
               payload = {
@@ -157,13 +163,15 @@ jobs:
                   "platform": PLATFORM,
                   "file_name": file_name,
                   "result_url": result_url,
-                  "pixeldrain_url": result_url if PLATFORM == "pixeldrain" else "",
+                  "pixeldrain_url": result_url if PLATFORM in ("pixeldrain", "pixeldrain_keepalive") else "",
                   'gofile_url': result_url if PLATFORM == "gofile" else "",
                   'buzzheavier_url': result_url if PLATFORM == "buzzheavier" else "",
                   'fuckingfast_url': result_url if PLATFORM == "fuckingfast" else "",
                   'result_status': result_status,
                   "message": message,
               }
+              if isinstance(extra_fields, dict):
+                  payload.update(extra_fields)
               response = requests.post(CALLBACK_URL, json=payload, headers=HEADERS, timeout=45)
               response.raise_for_status()
               print(f"::notice title=WordPress Queue Updated::HTTP {response.status_code} - {response.text[:500]}")
@@ -192,7 +200,7 @@ jobs:
           def request_google_cloud_fast_fallback():
               """Ask the authenticated WordPress queue endpoint for this post's Google Cloud (Fast) URL."""
               if not DUPLICATE_CHECK_URL or not WEBHOOK_SECRET or not POST_ID:
-                  raise RuntimeError("Google Drive quota was exceeded, but the WordPress fallback lookup is not configured (missing endpoint, webhook secret, or post ID).")
+                  raise RuntimeError("Google Drive source is unavailable, but the WordPress Cloud Fast fallback lookup is not configured (missing endpoint, webhook secret, or post ID).")
               payload = {
                   "action": "get_google_cloud_fast_fallback",
                   "webhook_secret": WEBHOOK_SECRET,
@@ -213,7 +221,7 @@ jobs:
                   raise RuntimeError("WordPress returned invalid JSON while looking up the Google Cloud (Fast) fallback URL.") from error
               if not isinstance(data, dict) or not data.get("success") or not data.get("fallback_available"):
                   detail = str(data.get("error") or "No Google Cloud (Fast) link is saved in this File post.") if isinstance(data, dict) else "Unexpected WordPress response."
-                  raise RuntimeError(f"Google Drive download quota was exceeded, and the File post has no usable Google Cloud (Fast) fallback: {detail}")
+                  raise RuntimeError(f"Google Drive source is unavailable, and the File post has no usable Google Cloud (Fast) fallback: {detail}")
               fallback_url = str(data.get("fallback_url") or "").strip()
               from urllib.parse import urlparse
               parsed = urlparse(fallback_url)
@@ -221,6 +229,253 @@ jobs:
                   raise RuntimeError("WordPress returned an invalid Google Cloud (Fast) fallback URL. HTTPS is required.")
               data["fallback_url"] = fallback_url
               return data
+
+          def request_pixeldrain_source_fallback(explicit_pd_id=""):
+              """Resolve the authenticated Pixeldrain fallback for this CLOBD File post."""
+              if not DUPLICATE_CHECK_URL or not WEBHOOK_SECRET or not POST_ID:
+                  raise RuntimeError("Pixeldrain source fallback is not configured (missing WordPress endpoint, webhook secret, or post ID).")
+
+              explicit_pd_id = str(explicit_pd_id or "").strip()
+              if explicit_pd_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", explicit_pd_id):
+                  raise RuntimeError("The queued Pixeldrain source ID has an invalid format.")
+
+              payload = {
+                  "action": "get_pixeldrain_source_fallback",
+                  "webhook_secret": WEBHOOK_SECRET,
+                  "post_id": POST_ID,
+              }
+              if explicit_pd_id:
+                  payload["pixeldrain_id"] = explicit_pd_id
+
+              response = requests.post(
+                  DUPLICATE_CHECK_URL,
+                  json=payload,
+                  headers=HEADERS,
+                  timeout=(20, 60),
+              )
+              if response.status_code != 200:
+                  detail = response.text[:700] if response.text else "No response body"
+                  raise RuntimeError(f"WordPress Pixeldrain fallback lookup failed (HTTP {response.status_code}): {detail}")
+              try:
+                  data = response.json()
+              except ValueError as error:
+                  raise RuntimeError("WordPress returned invalid JSON while looking up the Pixeldrain source fallback.") from error
+
+              if not isinstance(data, dict) or not data.get("success") or not data.get("fallback_available"):
+                  detail = str(data.get("error") or "No verified Pixeldrain source is saved for this File post.") if isinstance(data, dict) else "Unexpected WordPress response."
+                  raise RuntimeError(f"No usable Pixeldrain source fallback is available: {detail}")
+
+              pd_id = str(data.get("pixeldrain_id") or "").strip()
+              if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", pd_id):
+                  raise RuntimeError("WordPress returned an invalid Pixeldrain File ID.")
+              if explicit_pd_id and pd_id != explicit_pd_id:
+                  raise RuntimeError("WordPress returned a different Pixeldrain File ID than the queued source.")
+
+              fallback_url = str(data.get("fallback_url") or "").strip()
+              parsed = urlparse(fallback_url)
+              if (
+                  parsed.scheme.lower() != "https"
+                  or parsed.hostname not in ("pixeldrain.com", "www.pixeldrain.com")
+                  or parsed.username
+                  or parsed.password
+                  or not parsed.path.startswith("/api/file/")
+              ):
+                  raise RuntimeError("WordPress returned an invalid Pixeldrain download URL. A trusted HTTPS Pixeldrain API URL is required.")
+
+              try:
+                  file_size = int(data.get("file_size", 0) or 0)
+              except (TypeError, ValueError):
+                  file_size = 0
+              if file_size <= 0:
+                  raise RuntimeError("Pixeldrain did not provide a valid non-zero source file size.")
+
+              file_name = _safe_local_filename(data.get("file_name"))
+              if not file_name:
+                  raise RuntimeError("Pixeldrain did not provide a safe source filename.")
+
+              return {
+                  "pixeldrain_id": pd_id,
+                  "fallback_url": fallback_url,
+                  "pixeldrain_api": str(data.get("pixeldrain_api") or "").strip(),
+                  "file_name": file_name,
+                  "file_size": file_size,
+              }
+
+          def download_from_pixeldrain_source(fallback_info, download_dir):
+              """Stream and verify the complete existing Pixeldrain file to local disk."""
+              fallback_url = fallback_info["fallback_url"]
+              expected_size = int(fallback_info["file_size"])
+              file_name = _safe_local_filename(fallback_info.get("file_name"))
+              if not file_name or expected_size <= 0:
+                  raise RuntimeError("Pixeldrain fallback metadata is incomplete; download stopped.")
+
+              parsed = urlparse(fallback_url)
+              if parsed.scheme.lower() != "https" or parsed.hostname not in ("pixeldrain.com", "www.pixeldrain.com"):
+                  raise RuntimeError("Pixeldrain fallback URL failed the HTTPS host validation.")
+
+              api_key = str(fallback_info.get("pixeldrain_api") or "").strip()
+              auth = ("", api_key) if api_key else None
+              part_path = os.path.join(download_dir, f".clobd-pixeldrain-source-{JOB_ID}.part")
+              final_path = os.path.join(download_dir, file_name)
+              total_written = 0
+              last_progress_bytes = 0
+              last_progress_time = 0.0
+
+              try:
+                  with requests.get(
+                      fallback_url,
+                      auth=auth,
+                      headers={"User-Agent": HEADERS["User-Agent"], "Accept": "*/*"},
+                      stream=True,
+                      allow_redirects=True,
+                      timeout=(30, 300),
+                  ) as response:
+                      if response.status_code != 200:
+                          detail = response.text[:700] if response.text else "No response body"
+                          raise RuntimeError(f"Pixeldrain source download failed (HTTP {response.status_code}): {detail}")
+                      if urlparse(response.url).scheme.lower() != "https":
+                          raise RuntimeError("Pixeldrain redirected the source download to a non-HTTPS URL; transfer blocked.")
+
+                      content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
+                      if content_type in ("text/html", "application/json", "application/problem+json"):
+                          raise RuntimeError(f"Pixeldrain returned {content_type} instead of file data. The file may be unavailable or access was blocked.")
+
+                      try:
+                          content_length = int(response.headers.get("Content-Length", "0") or 0)
+                      except (TypeError, ValueError):
+                          content_length = 0
+                      if content_length > 0 and content_length != expected_size:
+                          raise RuntimeError(f"Pixeldrain Content-Length does not match its file metadata ({content_length} != {expected_size} bytes).")
+
+                      chunks = iter(response.iter_content(chunk_size=8 * 1024 * 1024))
+                      first_chunk = next(chunks, b"")
+                      preview = (first_chunk or b"").lstrip()[:160].lower()
+                      error_document = preview.startswith((
+                          b"<!doctype html", b"<html", b'{"error"', b'{"success":false', b'{"value":"file_'
+                      ))
+                      if not first_chunk or error_document:
+                          raise RuntimeError("Pixeldrain returned an empty file or an API/error document instead of the source file.")
+
+                      with open(part_path, "wb") as output:
+                          output.write(first_chunk)
+                          total_written += len(first_chunk)
+                          for chunk in chunks:
+                              if not chunk:
+                                  continue
+                              output.write(chunk)
+                              total_written += len(chunk)
+                              now = time.time()
+                              if total_written - last_progress_bytes >= 64 * 1024 * 1024 or now - last_progress_time >= 30:
+                                  last_progress_bytes = total_written
+                                  last_progress_time = now
+                                  percent = min(99, int(total_written * 100 / expected_size))
+                                  update_progress(
+                                      "downloading_pixeldrain",
+                                      f"Downloading Pixeldrain source ({percent}% · {total_written / (1024 ** 2):.0f} MiB received).",
+                                      file_name,
+                                  )
+
+                  if total_written != expected_size:
+                      raise RuntimeError(f"Pixeldrain source download was incomplete: expected {expected_size} bytes, received {total_written} bytes.")
+                  if not os.path.isfile(part_path) or os.path.getsize(part_path) != expected_size:
+                      raise RuntimeError("Pixeldrain source verification failed after download.")
+
+                  os.replace(part_path, final_path)
+                  return final_path
+              except Exception:
+                  try:
+                      if os.path.exists(part_path):
+                          os.remove(part_path)
+                  except OSError:
+                      pass
+                  raise
+
+          def download_from_google_drive(source_id, download_dir):
+              """Download a Google Drive source into an isolated job directory."""
+              drive_dir = os.path.join(download_dir, "google-drive-source")
+              os.makedirs(drive_dir, exist_ok=True)
+              previous_cwd = os.getcwd()
+              downloaded_path = ""
+              try:
+                  try:
+                      os.chdir(drive_dir)
+                      drive_url = f"https://drive.google.com/uc?id={source_id}"
+                      downloaded = gdown.download(drive_url, quiet=False)
+                      if not downloaded:
+                          raise RuntimeError("gdown did not return a downloaded file path (the Drive file may be missing, private, or unavailable).")
+                      downloaded_path = os.path.abspath(downloaded)
+                  finally:
+                      os.chdir(previous_cwd)
+
+                  if not os.path.isfile(downloaded_path):
+                      raise RuntimeError("Google Drive download did not produce a file on disk.")
+                  if os.path.getsize(downloaded_path) <= 0:
+                      raise RuntimeError("Google Drive returned an empty file.")
+                  with open(downloaded_path, "rb") as downloaded_file:
+                      preview = downloaded_file.read(512).lstrip().lower()
+                  if preview.startswith((b"<!doctype html", b"<html")):
+                      raise RuntimeError("Google Drive returned an HTML error page instead of the source file.")
+                  return downloaded_path
+              except Exception:
+                  # gdown can leave a partial file when the source is deleted or
+                  # access is denied. Remove it before trying another full copy.
+                  for entry in os.listdir(drive_dir):
+                      entry_path = os.path.join(drive_dir, entry)
+                      try:
+                          if os.path.isfile(entry_path) or os.path.islink(entry_path):
+                              os.remove(entry_path)
+                      except OSError:
+                          pass
+                  raise
+
+          def download_source_with_fallback(source_id, download_dir):
+              """Try Google Drive, then Cloud Fast, then the verified Pixeldrain copy."""
+              source_id = str(source_id or "").strip()
+              pixeldrain_source_id = ""
+              failures = []
+              prefix = "pd:"
+
+              if source_id.startswith(prefix):
+                  pixeldrain_source_id = source_id[len(prefix):].strip()
+                  if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", pixeldrain_source_id):
+                      failures.append("Queued Pixeldrain source ID: invalid file ID format")
+                      pixeldrain_source_id = ""
+                  else:
+                      failures.append("Google Drive: no Google Drive source ID is saved; using alternate sources")
+              else:
+                  try:
+                      update_progress("downloading", "Downloading the source file from Google Drive.")
+                      downloaded = download_from_google_drive(source_id, download_dir)
+                      print("::notice title=Download Source::Google Drive source download completed.")
+                      return downloaded, "Google Drive"
+                  except Exception as drive_error:
+                      detail = str(drive_error) or drive_error.__class__.__name__
+                      failures.append("Google Drive: " + detail[:500])
+                      print(f"::warning title=Google Drive Source Unavailable::{detail[:700]}")
+
+              try:
+                  update_progress("downloading_fallback", "Google Drive is unavailable. Trying the saved Google Cloud (Fast) source link.")
+                  cloud_info = request_google_cloud_fast_fallback()
+                  downloaded = download_from_google_cloud_fast(cloud_info, download_dir)
+                  print("::notice title=Download Source::Google Cloud (Fast) source download completed.")
+                  return downloaded, "Google Cloud (Fast)"
+              except Exception as cloud_error:
+                  detail = str(cloud_error) or cloud_error.__class__.__name__
+                  failures.append("Google Cloud (Fast): " + detail[:500])
+                  print(f"::warning title=Google Cloud Fast Source Unavailable::{detail[:700]}")
+
+              try:
+                  update_progress("downloading_fallback", "Google Drive and Google Cloud (Fast) are unavailable. Trying the verified Pixeldrain source copy.")
+                  pd_info = request_pixeldrain_source_fallback(pixeldrain_source_id)
+                  downloaded = download_from_pixeldrain_source(pd_info, download_dir)
+                  print(f"::notice title=Download Source::Pixeldrain source #{pd_info['pixeldrain_id']} downloaded and size-verified.")
+                  return downloaded, "Pixeldrain"
+              except Exception as pixeldrain_error:
+                  detail = str(pixeldrain_error) or pixeldrain_error.__class__.__name__
+                  failures.append("Pixeldrain: " + detail[:500])
+                  print(f"::error title=Pixeldrain Source Unavailable::{detail[:700]}")
+
+              raise RuntimeError("All source download options failed. " + " | ".join(failures))
 
           def _filename_from_content_disposition(header_value):
               if not header_value:
@@ -344,14 +599,152 @@ jobs:
                       return file_id, f"https://pixeldrain.com/u/{quote(file_id, safe='')}"
               return "", ""
 
+
+          def fetch_pixeldrain_file_info(file_id):
+              """Fetch authoritative Pixeldrain metadata for one existing file."""
+              info_url = f"https://pixeldrain.com/api/file/{quote(file_id, safe='')}/info"
+              auth = ("", PIXELDRAIN_API) if PIXELDRAIN_API else None
+              response = requests.get(
+                  info_url,
+                  auth=auth,
+                  headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"},
+                  timeout=(20, 90),
+              )
+              if response.status_code != 200:
+                  detail = response.text[:700] if response.text else "No response body"
+                  raise RuntimeError(f"Pixeldrain file-info request failed (HTTP {response.status_code}): {detail}")
+              try:
+                  data = response.json()
+              except ValueError as error:
+                  raise RuntimeError("Pixeldrain file-info API returned invalid JSON.") from error
+              if not isinstance(data, dict) or data.get("success") is False:
+                  detail = data.get("message", "File information was not returned.") if isinstance(data, dict) else "Unexpected API response."
+                  raise RuntimeError(f"Pixeldrain could not verify file {file_id}: {detail}")
+              if str(data.get("id", "")).strip() != file_id:
+                  raise RuntimeError("Pixeldrain returned metadata for a different file ID.")
+              try:
+                  file_size = int(data.get("size", 0) or 0)
+              except (TypeError, ValueError):
+                  file_size = 0
+              if file_size <= 0:
+                  raise RuntimeError("Pixeldrain returned an empty or invalid file size; Keep-Alive was stopped.")
+              data["size"] = file_size
+              return data
+
+          def perform_pixeldrain_keepalive(file_id):
+              """Transfer only the configured qualifying percentage in one GET request."""
+              info_before = fetch_pixeldrain_file_info(file_id)
+              file_size = int(info_before["size"])
+              file_name = _safe_local_filename(info_before.get("name")) or f"Pixeldrain-{file_id}"
+              requested_bytes = (file_size * KEEPALIVE_PERCENT + 99) // 100
+              # Pixeldrain requires strictly more than 10% in one request.
+              qualifying_floor = (file_size // 10) + 1
+              target_bytes = min(file_size, max(requested_bytes, qualifying_floor))
+              if target_bytes <= file_size // 10:
+                  raise RuntimeError("The requested Keep-Alive transfer would not exceed Pixeldrain's 10% minimum.")
+
+              file_url = f"https://pixeldrain.com/api/file/{quote(file_id, safe='')}?download"
+              auth = ("", PIXELDRAIN_API) if PIXELDRAIN_API else None
+              download_headers = {"User-Agent": HEADERS["User-Agent"], "Accept": "*/*"}
+              downloaded_bytes = 0
+              last_progress_bytes = 0
+              last_progress_time = 0.0
+              update_progress(
+                  "starting",
+                  f"Pixeldrain Keep-Alive: preparing a {KEEPALIVE_PERCENT}% qualifying transfer for {file_name}.",
+                  file_name,
+              )
+
+              with requests.get(
+                  file_url,
+                  auth=auth,
+                  headers=download_headers,
+                  stream=True,
+                  allow_redirects=True,
+                  timeout=(30, 300),
+              ) as response:
+                  if response.status_code != 200:
+                      detail = response.text[:700] if response.text else "No response body"
+                      raise RuntimeError(f"Pixeldrain file download failed (HTTP {response.status_code}): {detail}")
+                  if urlparse(response.url).scheme.lower() != "https":
+                      raise RuntimeError("Pixeldrain redirected the download to a non-HTTPS URL; the transfer was blocked.")
+
+                  content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
+                  if content_type in ("text/html", "application/json", "application/problem+json"):
+                      raise RuntimeError(f"Pixeldrain returned {content_type} instead of the file. The file may require a CAPTCHA or may be unavailable.")
+                  try:
+                      content_length = int(response.headers.get("Content-Length", "0") or 0)
+                  except (TypeError, ValueError):
+                      content_length = 0
+                  if content_length > 0 and content_length < target_bytes:
+                      raise RuntimeError(f"Pixeldrain response is shorter than the qualifying target ({content_length} < {target_bytes} bytes).")
+
+                  chunks = iter(response.iter_content(chunk_size=1024 * 1024))
+                  first_chunk = next(chunks, b"")
+                  preview = (first_chunk or b"").lstrip()[:160].lower()
+                  error_document = preview.startswith((
+                      b"<!doctype html", b"<html", b'{"error"', b'{"success":false', b'{"value":"file_'
+                  ))
+                  if not first_chunk or error_document:
+                      raise RuntimeError("Pixeldrain returned an empty file or an API/error document instead of file data.")
+
+                  downloaded_bytes = len(first_chunk)
+                  last_progress_bytes = downloaded_bytes
+                  last_progress_time = time.time()
+                  if downloaded_bytes < target_bytes:
+                      for chunk in chunks:
+                          if not chunk:
+                              continue
+                          downloaded_bytes += len(chunk)
+                          now = time.time()
+                          if downloaded_bytes - last_progress_bytes >= 64 * 1024 * 1024 or now - last_progress_time >= 30:
+                              last_progress_bytes = downloaded_bytes
+                              last_progress_time = now
+                              percent_done = min(99, int(downloaded_bytes * 100 / file_size))
+                              update_progress(
+                                  "downloading",
+                                  f"Pixeldrain Keep-Alive: {percent_done}% of the file received ({downloaded_bytes / (1024 ** 2):.0f} MiB).",
+                                  file_name,
+                              )
+                          if downloaded_bytes >= target_bytes:
+                              break
+
+              if downloaded_bytes < target_bytes:
+                  raise RuntimeError(f"Pixeldrain transfer ended early: needed {target_bytes} bytes but received {downloaded_bytes} bytes.")
+              actual_percent = round(downloaded_bytes * 100.0 / file_size, 2)
+
+              # A post-transfer metadata refresh is best-effort; the byte threshold above
+              # is the success condition, while WordPress will also refresh account stats.
+              info_after = info_before
+              try:
+                  info_after = fetch_pixeldrain_file_info(file_id)
+              except Exception as info_error:
+                  print(f"::warning title=Pixeldrain Keep-Alive Metadata::{info_error}")
+
+              result_url = f"https://pixeldrain.com/u/{quote(file_id, safe='')}"
+              message = (
+                  f"Pixeldrain Keep-Alive transfer completed: {downloaded_bytes:,} of {file_size:,} bytes "
+                  f"({actual_percent:.2f}%) received in one request. Configured target: {KEEPALIVE_PERCENT}%. "
+                  "Pixeldrain's expiry refresh is limited to once per 24 hours."
+              )
+              return {
+                  "file_name": file_name,
+                  "result_url": result_url,
+                  "downloaded_bytes": downloaded_bytes,
+                  "actual_percent": actual_percent,
+                  "file_size": file_size,
+                  "info": info_after,
+                  "message": message,
+              }
+
           file_name = ""
           result_url = ""
           final_sent = False
 
           try:
               if not JOB_ID or not POST_ID or not GDRIVE_ID:
-                  raise RuntimeError("Queue job ID, WordPress post ID, or Google Drive file ID is missing.")
-              if PLATFORM not in ("pixeldrain", "gofile", "buzzheavier", "fuckingfast"):
+                  raise RuntimeError("Queue job ID, WordPress post ID, or source ID is missing.")
+              if PLATFORM not in ("pixeldrain", "pixeldrain_keepalive", "gofile", "buzzheavier", "fuckingfast"):
                   raise RuntimeError(f"Unsupported upload platform: {PLATFORM}")
               if PLATFORM == "pixeldrain" and not PIXELDRAIN_API:
                   raise RuntimeError("Pixeldrain API key is missing. Configure it in WordPress > Files > Settings.")
@@ -362,38 +755,65 @@ jobs:
               if PLATFORM == "fuckingfast" and not FUCKINGFAST_ACCOUNT_ID:
                   raise RuntimeError("GitHub Actions secret FUCKINGFAST_ACCOUNT_ID is missing. Enter your FUCKINGFAST Account ID in WordPress > Files > Settings and validate/sync it.")
 
+              # Keepalive queue rows carry "pd_keepalive:<Pixeldrain ID>" in gdrive_id.
+              # They must never enter the normal Google Drive download/provider-upload path.
+              if PLATFORM == "pixeldrain_keepalive":
+                  prefix = "pd_keepalive:"
+                  if not GDRIVE_ID.startswith(prefix):
+                      raise RuntimeError("Pixeldrain Keep-Alive job has an invalid source ID prefix.")
+                  keepalive_file_id = GDRIVE_ID[len(prefix):].strip()
+                  if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", keepalive_file_id):
+                      raise RuntimeError("Pixeldrain Keep-Alive job contains an invalid Pixeldrain file ID.")
+
+                  print(f"::notice title=Pixeldrain Keep-Alive::Job #{JOB_ID} | Post #{POST_ID} | File ID: {keepalive_file_id} | Target: {KEEPALIVE_PERCENT}%")
+                  update_progress("downloading", "Connecting to the existing Pixeldrain file for its qualifying Keep-Alive transfer.")
+                  keepalive_result = perform_pixeldrain_keepalive(keepalive_file_id)
+                  info = keepalive_result["info"]
+                  result_url = keepalive_result["result_url"]
+                  file_name = keepalive_result["file_name"]
+                  message = keepalive_result["message"]
+
+                  update_progress("finishing", "Qualifying Pixeldrain Keep-Alive transfer completed; reporting metrics to WordPress.", file_name)
+                  send_final_result(
+                      "completed",
+                      file_name,
+                      result_url,
+                      message,
+                      extra_fields={
+                          "keepalive_pd_id": keepalive_file_id,
+                          "keepalive_bytes": keepalive_result["downloaded_bytes"],
+                          "keepalive_percent": keepalive_result["actual_percent"],
+                          "pd_downloads": max(0, int(info.get("downloads", 0) or 0)),
+                          "pd_views": max(0, int(info.get("views", 0) or 0)),
+                          "pd_bandwidth_used": max(0, int(info.get("bandwidth_used", 0) or 0)),
+                          "pd_date_upload": str(info.get("date_upload", "") or ""),
+                          "pd_date_last_view": str(info.get("date_last_view", info.get("date_last_viewed", "")) or ""),
+                          "pd_file_size": keepalive_result["file_size"],
+                      },
+                  )
+                  final_sent = True
+                  print(f"::notice title=Pixeldrain Keep-Alive Complete::{result_url} - {message}")
+                  sys.exit(0)
+
               download_dir = os.path.abspath("downloads")
               os.makedirs(download_dir, exist_ok=True)
               os.chdir(download_dir)
 
-              update_progress("downloading", "Downloading the source file from Google Drive.")
               print(f"::notice title=Queue Job::Job #{JOB_ID} | Post #{POST_ID} | Platform: {PLATFORM}")
-              drive_url = f"https://drive.google.com/uc?id={GDRIVE_ID}"
-              downloaded_path = ""
-              try:
-                  downloaded_path = gdown.download(drive_url, quiet=False)
-              except Exception as gdrive_error:
-                  gdrive_error_text = str(gdrive_error)
-                  if not is_google_drive_quota_error(gdrive_error_text):
-                      raise
-                  print("::warning title=Google Drive Download Quota::Google Drive blocked this file because its recent download/view quota was exceeded. Trying the Google Cloud (Fast) link saved in the same CLOBD File post.")
-                  update_progress("downloading_fallback", "Google Drive download quota exceeded. Looking up the Google Cloud (Fast) fallback in this File post.")
-                  fallback_info = request_google_cloud_fast_fallback()
-                  print(f"::notice title=Download Fallback::Found Google Cloud (Fast) link in post #{POST_ID}; downloading the alternate source.")
-                  downloaded_path = download_from_google_cloud_fast(fallback_info, download_dir)
-                  print("::notice title=Download Fallback Complete::Google Cloud (Fast) download completed; continuing with the existing provider upload flow.")
+              downloaded_path, source_provider = download_source_with_fallback(GDRIVE_ID, download_dir)
               if not downloaded_path or not os.path.isfile(downloaded_path):
-                  raise RuntimeError("Google Drive file could not be downloaded. Check access permissions and the source link.")
+                  raise RuntimeError(f"{source_provider} did not produce a verified source file.")
 
               file_path = os.path.abspath(downloaded_path)
               file_name = os.path.basename(file_path)
               if not file_name:
-                  raise RuntimeError("Google Drive returned an empty filename.")
+                  raise RuntimeError(f"{source_provider} returned an empty filename.")
               file_size = os.path.getsize(file_path)
               if file_size <= 0:
-                  raise RuntimeError("Downloaded file is empty. Upload cancelled.")
+                  raise RuntimeError(f"{source_provider} returned an empty file. Upload cancelled.")
               file_size_gb = round(file_size / (1024 ** 3), 3)
-              print(f"::notice title=Downloaded::{file_name} | {file_size_gb} GiB")
+              print(f"::notice title=Downloaded::{file_name} | {file_size_gb} GiB | Source: {source_provider}")
+              update_progress("source_ready", f"Verified source download completed using {source_provider}; preparing the {PLATFORM} upload.", file_name)
 
               if PLATFORM == "fuckingfast":
                   # FUCKINGFAST links can expire or be deleted while their old
@@ -1470,8 +1890,9 @@ jobs:
                       f"File size: {file_size_gb} GiB. {public_probe_note}"
                   )
 
-              print(f"::notice title={PLATFORM.title()} Upload Complete::{result_url}")
-              update_progress("finishing", f"Upload completed; saving the {PLATFORM} URL to WordPress.", file_name)
+              message = f"{message} Source used: {source_provider}."
+              print(f"::notice title={PLATFORM.title()} Upload Complete::{result_url} | Source: {source_provider}")
+              update_progress("finishing", f"Upload completed from {source_provider}; saving the {PLATFORM} URL to WordPress.", file_name)
               send_final_result("completed", file_name, result_url, message)
               final_sent = True
 
