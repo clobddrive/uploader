@@ -71,6 +71,12 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip gdown requests requests-toolbelt
 
+      - name: Install Chromium for Pixeldrain Keep-Alive
+        if: ${{ github.event.client_payload.platform == 'pixeldrain_keepalive' }}
+        run: |
+          python3 -m pip install --upgrade playwright
+          python3 -m playwright install --with-deps chromium
+
       - name: Download and Upload to Selected Provider
         shell: python
         env:
@@ -94,6 +100,7 @@ jobs:
           import os
           import sys
           import time
+          import asyncio
           import traceback
           import hashlib
           import requests
@@ -600,7 +607,7 @@ jobs:
 
           def fetch_pixeldrain_file_info(file_id, session=None):
               """Fetch authoritative Pixeldrain metadata, bypassing stale HTTP caches."""
-              info_url = f"https://pixeldrain.com/api/file/{quote(file_id, safe='')}/info"
+              info_url = f"https://pixeldrain.com/api/file/{quote(file_id, safe='')}/info?clobd_nocache={time.time_ns()}"
               auth = ("", PIXELDRAIN_API) if PIXELDRAIN_API else None
               requester = session if session is not None else requests
               response = requester.get(
@@ -609,8 +616,9 @@ jobs:
                   headers={
                       "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
                       "Accept": "application/json",
-                      "Cache-Control": "no-cache",
+                      "Cache-Control": "no-store, no-cache, max-age=0",
                       "Pragma": "no-cache",
+                      "Expires": "0",
                   },
                   timeout=(20, 90),
               )
@@ -636,7 +644,7 @@ jobs:
               return data
 
           def perform_pixeldrain_keepalive(file_id):
-              """Fully download one Pixeldrain file, verify its size/SHA-256, and inspect server counters."""
+              """Use a real browser download, verify bytes/hash, and confirm Pixeldrain accounting."""
               info_before = fetch_pixeldrain_file_info(file_id)
               file_size = int(info_before["size"])
               file_name = _safe_local_filename(info_before.get("name")) or f"Pixeldrain-{file_id}"
@@ -645,143 +653,267 @@ jobs:
                   raise RuntimeError("Pixeldrain did not provide a valid SHA-256 checksum for this file. Full-download verification cannot safely continue.")
 
               downloads_before = max(0, int(info_before.get("downloads", 0) or 0))
-              bandwidth_before = max(0, int(info_before.get("bandwidth_used", 0) or 0))
               views_before = max(0, int(info_before.get("views", 0) or 0))
+              bandwidth_before = max(0, int(info_before.get("bandwidth_used", 0) or 0))
+              bandwidth_paid_before = max(0, int(info_before.get("bandwidth_used_paid", 0) or 0))
+              date_last_view_before = str(info_before.get("date_last_view", "") or "")
               viewer_url = f"https://pixeldrain.com/u/{quote(file_id, safe='')}"
-              file_url = f"https://pixeldrain.com/api/file/{quote(file_id, safe='')}?download"
-              auth = ("", PIXELDRAIN_API) if PIXELDRAIN_API else None
-              browser_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+              browser_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+              safe_job = re.sub(r"[^A-Za-z0-9_-]", "_", RUN_ID or JOB_ID or "run")
+              temp_download_path = os.path.join(tempfile.gettempdir(), f"clobd-pd-keepalive-{file_id}-{safe_job}.bin")
+              try:
+                  if os.path.exists(temp_download_path):
+                      os.remove(temp_download_path)
+              except OSError:
+                  pass
+
+              update_progress(
+                  "starting",
+                  f"Pixeldrain Keep-Alive: opening the real file viewer in Chromium before downloading all {file_size:,} bytes.",
+                  file_name,
+              )
+
+              async def _download_from_real_viewer():
+                  try:
+                      from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+                  except ImportError as error:
+                      raise RuntimeError("Playwright/Chromium is not installed for this Pixeldrain Keep-Alive run.") from error
+
+                  transfer_responses = []
+                  async with async_playwright() as playwright:
+                      browser = await playwright.chromium.launch(
+                          headless=True,
+                          args=["--no-sandbox", "--disable-dev-shm-usage"],
+                      )
+                      context = await browser.new_context(
+                          accept_downloads=True,
+                          user_agent=browser_ua,
+                          locale="en-US",
+                      )
+                      page = await context.new_page()
+                      page.set_default_timeout(45000)
+
+                      def _record_response(response):
+                          try:
+                              parsed = urlparse(response.url)
+                              if (
+                                  parsed.hostname
+                                  and parsed.hostname.lower().endswith("pixeldrain.com")
+                                  and parsed.path.startswith(f"/api/file/{file_id}")
+                                  and not parsed.path.endswith("/info")
+                              ):
+                                  transfer_responses.append({"status": int(response.status), "url": response.url})
+                          except Exception:
+                              pass
+
+                      page.on("response", _record_response)
+                      try:
+                          navigation_response = await page.goto(
+                              viewer_url,
+                              wait_until="domcontentloaded",
+                              timeout=120000,
+                          )
+                          if navigation_response is not None and navigation_response.status >= 400:
+                              raise RuntimeError(
+                                  f"Pixeldrain viewer page returned HTTP {navigation_response.status}."
+                              )
+                          try:
+                              await page.wait_for_load_state("networkidle", timeout=15000)
+                          except PlaywrightTimeoutError:
+                              pass
+                          await page.wait_for_timeout(3000)
+
+                          body_text = ""
+                          try:
+                              body_text = await page.locator("body").inner_text(timeout=10000)
+                          except Exception:
+                              pass
+                          body_lower = body_text.casefold()
+                          iframe_challenge = await page.locator(
+                              'iframe[src*="recaptcha"], iframe[src*="turnstile"], iframe[src*="captcha"], iframe[title*="captcha" i]'
+                          ).count()
+                          challenge_markers = (
+                              "captcha",
+                              "verify you are human",
+                              "verify that you are human",
+                              "i am not a robot",
+                              "i'm not a robot",
+                              "complete the security check",
+                              "too much bandwidth",
+                          )
+                          if iframe_challenge or any(marker in body_lower for marker in challenge_markers):
+                              raise RuntimeError(
+                                  "Pixeldrain displayed a CAPTCHA, human-verification, or download-limit challenge in the real browser. "
+                                  "Keep-Alive stopped without trying to bypass the challenge. Open the file manually in a browser and complete any required verification."
+                              )
+
+                          # Click an actual visible Download control rendered by Pixeldrain.
+                          # Do not fabricate an API request or bypass the viewer's controls.
+                          download_control = None
+                          for role in ("button", "link"):
+                              locator = page.get_by_role(role, name=re.compile(r"download", re.IGNORECASE))
+                              try:
+                                  count = min(await locator.count(), 20)
+                              except Exception:
+                                  count = 0
+                              for index in range(count):
+                                  candidate = locator.nth(index)
+                                  try:
+                                      if await candidate.is_visible() and await candidate.is_enabled():
+                                          download_control = candidate
+                                          break
+                                  except Exception:
+                                      continue
+                              if download_control is not None:
+                                  break
+
+                          if download_control is None:
+                              visible_controls = await page.evaluate(
+                                  """() => Array.from(document.querySelectorAll('button,a,[role=button]'))
+                                      .filter(el => {
+                                          const r = el.getBoundingClientRect();
+                                          const s = getComputedStyle(el);
+                                          return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+                                      })
+                                      .map(el => ({
+                                          tag: el.tagName.toLowerCase(),
+                                          text: (el.innerText || '').trim().slice(0, 90),
+                                          aria: (el.getAttribute('aria-label') || '').slice(0, 90),
+                                          title: (el.getAttribute('title') || '').slice(0, 90)
+                                      })).slice(0, 25)"""
+                              )
+                              short_text = re.sub(r"\s+", " ", body_text).strip()[:500]
+                              raise RuntimeError(
+                                  "Pixeldrain viewer loaded, but Chromium could not find a visible Download button/link. "
+                                  f"Visible controls: {json.dumps(visible_controls, ensure_ascii=False)[:1200]}. "
+                                  f"Page text: {short_text or 'unavailable'}"
+                              )
+
+                          update_progress(
+                              "downloading",
+                              "Pixeldrain viewer opened in Chromium. Clicking its visible Download control and receiving the complete original file.",
+                              file_name,
+                          )
+                          try:
+                              async with page.expect_download(timeout=60000) as download_event:
+                                  await download_control.click(timeout=45000)
+                              browser_download = await download_event.value
+                          except PlaywrightTimeoutError as error:
+                              after_click_text = ""
+                              try:
+                                  after_click_text = (await page.locator("body").inner_text(timeout=5000)).casefold()
+                              except Exception:
+                                  pass
+                              if any(marker in after_click_text for marker in challenge_markers):
+                                  raise RuntimeError(
+                                      "Pixeldrain requested CAPTCHA/human verification after the Download click. "
+                                      "The automated Keep-Alive stopped; no challenge was bypassed."
+                                  ) from error
+                              raise RuntimeError(
+                                  "The real Pixeldrain Download control was clicked, but Chromium did not start a file download. "
+                                  "The page may require an interactive verification or may have rejected automated access."
+                              ) from error
+
+                          failure = await browser_download.failure()
+                          if failure:
+                              raise RuntimeError(f"Chromium reported a Pixeldrain download failure: {failure}")
+                          await browser_download.save_as(temp_download_path)
+                          return {
+                              "suggested_filename": browser_download.suggested_filename,
+                              "responses": transfer_responses,
+                              "page_text": re.sub(r"\s+", " ", body_text).strip()[:500],
+                          }
+                      finally:
+                          await context.close()
+                          await browser.close()
+
+              try:
+                  browser_result = asyncio.run(_download_from_real_viewer())
+              except RuntimeError:
+                  try:
+                      if os.path.exists(temp_download_path):
+                          os.remove(temp_download_path)
+                  except OSError:
+                      pass
+                  raise
+              except Exception as error:
+                  try:
+                      if os.path.exists(temp_download_path):
+                          os.remove(temp_download_path)
+                  except OSError:
+                      pass
+                  raise RuntimeError(f"Pixeldrain real-browser download failed: {error}") from error
+
+              if not os.path.isfile(temp_download_path):
+                  raise RuntimeError("Chromium reported a completed download but the downloaded file was not saved to the runner.")
+
               downloaded_bytes = 0
               last_progress_bytes = 0
               last_progress_time = time.time()
               digest = hashlib.sha256()
-
-              update_progress(
-                  "starting",
-                  f"Pixeldrain Keep-Alive: opening the file page, then downloading the complete {file_size:,}-byte file.",
-                  file_name,
-              )
-
-              # Visit the normal Pixeldrain viewer first and keep its cookies. The
-              # subsequent file request carries this page as Referer. This is a
-              # normal navigation sequence, not a CAPTCHA or hotlink restriction bypass.
-              with requests.Session() as session:
-                  page_response = session.get(
-                      viewer_url,
-                      headers={
-                          "User-Agent": browser_ua,
-                          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                          "Accept-Language": "en-US,en;q=0.9",
-                          "Cache-Control": "no-cache",
-                      },
-                      allow_redirects=True,
-                      timeout=(20, 90),
-                  )
-                  if page_response.status_code != 200:
-                      detail = page_response.text[:500] if page_response.text else "No response body"
-                      raise RuntimeError(f"Pixeldrain file page could not be opened (HTTP {page_response.status_code}): {detail}")
-                  if urlparse(page_response.url).scheme.lower() != "https":
-                      raise RuntimeError("Pixeldrain file page redirected to a non-HTTPS URL; download blocked.")
-                  referer_url = page_response.url
-                  page_response.close()
-
-                  download_headers = {
-                      "User-Agent": browser_ua,
-                      "Accept": "*/*",
-                      "Accept-Encoding": "identity",
-                      "Accept-Language": "en-US,en;q=0.9",
-                      "Referer": referer_url,
-                      "Cache-Control": "no-cache",
-                  }
-                  update_progress(
-                      "downloading",
-                      "Pixeldrain Keep-Alive: downloading 100% of the original file in one uninterrupted request.",
-                      file_name,
-                  )
-
+              try:
+                  with open(temp_download_path, "rb") as downloaded_file:
+                      while True:
+                          chunk = downloaded_file.read(4 * 1024 * 1024)
+                          if not chunk:
+                              break
+                          downloaded_bytes += len(chunk)
+                          digest.update(chunk)
+                          now = time.time()
+                          if downloaded_bytes - last_progress_bytes >= 64 * 1024 * 1024 or now - last_progress_time >= 30:
+                              last_progress_bytes = downloaded_bytes
+                              last_progress_time = now
+                              percent_done = min(99, int(downloaded_bytes * 100 / file_size))
+                              update_progress(
+                                  "verifying",
+                                  f"Pixeldrain browser download received {percent_done}% ({downloaded_bytes:,} / {file_size:,} bytes); verifying SHA-256.",
+                                  file_name,
+                              )
+              finally:
                   try:
-                      # Keep the file-content request anonymous. The API key is
-                      # used only for private metadata/account calls above; sending
-                      # it with the actual file GET can classify the transfer as an
-                      # authenticated owner download instead of a public visitor
-                      # download. Preserve the viewer-page cookies and Referer.
-                      with session.get(
-                          file_url,
-                          headers=download_headers,
-                          stream=True,
-                          allow_redirects=True,
-                          timeout=(30, 600),
-                      ) as response:
-                          if response.status_code != 200:
-                              detail = response.text[:900] if response.text else "No response body"
-                              try:
-                                  error_data = response.json()
-                                  if isinstance(error_data, dict):
-                                      detail = f"{error_data.get('value', 'download_error')}: {error_data.get('message', detail)}"
-                              except Exception:
-                                  pass
-                              raise RuntimeError(f"Pixeldrain full-file download failed (HTTP {response.status_code}): {detail}")
-                          if urlparse(response.url).scheme.lower() != "https":
-                              raise RuntimeError("Pixeldrain redirected the file download to a non-HTTPS URL; transfer blocked.")
-                          if response.headers.get("Content-Range"):
-                              raise RuntimeError("Pixeldrain returned a partial Content-Range response; a complete 200 OK file response is required.")
-
-                          try:
-                              content_length = int(response.headers.get("Content-Length", "0") or 0)
-                          except (TypeError, ValueError):
-                              content_length = 0
-                          if content_length > 0 and content_length != file_size:
-                              raise RuntimeError(f"Pixeldrain Content-Length does not match the source file size ({content_length} != {file_size}).")
-
-                          for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
-                              if not chunk:
-                                  continue
-                              downloaded_bytes += len(chunk)
-                              digest.update(chunk)
-                              now = time.time()
-                              if downloaded_bytes - last_progress_bytes >= 64 * 1024 * 1024 or now - last_progress_time >= 30:
-                                  last_progress_bytes = downloaded_bytes
-                                  last_progress_time = now
-                                  percent_done = min(99, int(downloaded_bytes * 100 / file_size))
-                                  update_progress(
-                                      "downloading",
-                                      f"Pixeldrain Keep-Alive: {percent_done}% received ({downloaded_bytes:,} / {file_size:,} bytes).",
-                                      file_name,
-                                  )
-                  except requests.RequestException as error:
-                      raise RuntimeError(f"Pixeldrain full-file stream was interrupted before completion: {error}") from error
+                      os.remove(temp_download_path)
+                  except OSError:
+                      pass
 
               if downloaded_bytes != file_size:
-                  raise RuntimeError(f"Pixeldrain full-file download was incomplete: received {downloaded_bytes:,} of {file_size:,} bytes.")
+                  raise RuntimeError(
+                      f"Pixeldrain browser download was incomplete: received {downloaded_bytes:,} of {file_size:,} bytes."
+                  )
               actual_sha256 = digest.hexdigest().lower()
               if actual_sha256 != expected_sha256:
-                  raise RuntimeError(f"Pixeldrain full-file SHA-256 verification failed for {file_name}; the downloaded bytes do not match the source file.")
+                  raise RuntimeError(
+                      f"Pixeldrain full-file SHA-256 verification failed for {file_name}; downloaded bytes do not match the source file."
+                  )
 
-              # Confirm that Pixeldrain itself recorded this as a qualifying
-              # transfer. A full body received by GitHub alone does not prove that
-              # Pixeldrain's expiry-refresh accounting accepted the request.
-              # "downloads" is unique per IP, so allow the alternative proof that
-              # bandwidth_used increased by more than 10% of this file's size.
               min_expiry_bandwidth_delta = (file_size // 10) + 1
               update_progress(
                   "verifying",
-                  "The complete file passed SHA-256. Waiting for Pixeldrain to record the download/bandwidth activity.",
+                  "Chromium received the complete file and SHA-256 matched. Checking fresh Pixeldrain download and bandwidth counters.",
                   file_name,
               )
               info_after = info_before
               metadata_after_available = False
               downloads_after = downloads_before
+              views_after = views_before
               bandwidth_after = bandwidth_before
-              # Pixeldrain statistics may be updated asynchronously. Poll for up
-              # to about one minute before deciding whether this was recorded.
+              bandwidth_paid_after = bandwidth_paid_before
+              date_last_view_after = date_last_view_before
               for attempt in range(12):
                   try:
                       info_after = fetch_pixeldrain_file_info(file_id)
                       metadata_after_available = True
                       downloads_after = max(0, int(info_after.get("downloads", 0) or 0))
+                      views_after = max(0, int(info_after.get("views", 0) or 0))
                       bandwidth_after = max(0, int(info_after.get("bandwidth_used", 0) or 0))
-                      bandwidth_delta = max(0, bandwidth_after - bandwidth_before)
-                      if downloads_after > downloads_before or bandwidth_delta >= min_expiry_bandwidth_delta:
+                      bandwidth_paid_after = max(0, int(info_after.get("bandwidth_used_paid", 0) or 0))
+                      date_last_view_after = str(info_after.get("date_last_view", "") or "")
+                      bandwidth_delta_now = max(0, bandwidth_after - bandwidth_before)
+                      bandwidth_paid_delta_now = max(0, bandwidth_paid_after - bandwidth_paid_before)
+                      if (
+                          downloads_after > downloads_before
+                          or bandwidth_delta_now >= min_expiry_bandwidth_delta
+                          or bandwidth_paid_delta_now >= min_expiry_bandwidth_delta
+                      ):
                           break
                   except Exception as info_error:
                       print(f"::warning title=Pixeldrain Counter Verification::{info_error}")
@@ -789,10 +921,14 @@ jobs:
                       time.sleep(5)
 
               downloads_after = max(0, int(info_after.get("downloads", downloads_before) or 0))
-              bandwidth_after = max(0, int(info_after.get("bandwidth_used", bandwidth_before) or 0))
               views_after = max(0, int(info_after.get("views", views_before) or 0))
+              bandwidth_after = max(0, int(info_after.get("bandwidth_used", bandwidth_before) or 0))
+              bandwidth_paid_after = max(0, int(info_after.get("bandwidth_used_paid", bandwidth_paid_before) or 0))
+              date_last_view_after = str(info_after.get("date_last_view", "") or "")
               counter_incremented = downloads_after > downloads_before
               bandwidth_delta = max(0, bandwidth_after - bandwidth_before)
+              bandwidth_paid_delta = max(0, bandwidth_paid_after - bandwidth_paid_before)
+              views_delta = max(0, views_after - views_before)
               actual_percent = 100.0
 
               if counter_incremented:
@@ -804,26 +940,33 @@ jobs:
                       f"the unique-IP downloads counter remained {downloads_after}."
                   )
                   print(f"::notice title=Pixeldrain Bandwidth Counter::{counter_note}")
+              elif bandwidth_paid_delta >= min_expiry_bandwidth_delta:
+                  counter_note = (
+                      f"Pixeldrain recorded the transfer in bandwidth_used_paid (+{bandwidth_paid_delta:,} bytes); "
+                      f"the unique-IP downloads counter remained {downloads_after}."
+                  )
+                  print(f"::notice title=Pixeldrain Paid Bandwidth Counter::{counter_note}")
               elif not metadata_after_available:
                   raise RuntimeError(
-                      "The full file was received and SHA-256 verified, but Pixeldrain's post-download file-info API "
+                      "The full file was received in Chromium and SHA-256 verified, but Pixeldrain's post-download file-info API "
                       "could not be read. Keep-Alive was NOT marked successful because server-side activity was not confirmed."
                   )
               else:
                   raise RuntimeError(
-                      "The full file was received and SHA-256 verified, but Pixeldrain recorded no download or bandwidth "
-                      f"increase after the transfer (downloads {downloads_before} → {downloads_after}; "
-                      f"bandwidth delta {bandwidth_delta:,} bytes; required bandwidth increase: "
-                      f"at least {min_expiry_bandwidth_delta:,} bytes). Keep-Alive was NOT marked successful. "
-                      "The API key is no longer sent with the file-content request; the request uses the normal viewer "
-                      "session and may still be blocked or uncounted by Pixeldrain's own hotlink/rate-limit policy."
+                      "Chromium downloaded the full file and SHA-256 matched, but Pixeldrain's API reported no qualifying "
+                      "server-side transfer activity after the browser download "
+                      f"(downloads {downloads_before} → {downloads_after}; views {views_before} → {views_after}; "
+                      f"bandwidth_used delta {bandwidth_delta:,} bytes; bandwidth_used_paid delta {bandwidth_paid_delta:,} bytes; "
+                      f"required bandwidth increase: at least {min_expiry_bandwidth_delta:,} bytes). "
+                      "Keep-Alive was NOT marked successful. The viewer page and its visible Download control were used; "
+                      "if counters still do not move, Pixeldrain may be excluding this runner/account transfer or applying an account/plan restriction."
                   )
 
               result_url = f"https://pixeldrain.com/u/{quote(file_id, safe='')}"
               message = (
-                  f"Pixeldrain FULL-FILE Keep-Alive verified: {downloaded_bytes:,} of {file_size:,} bytes received (100%). "
+                  f"Pixeldrain REAL-BROWSER FULL-FILE Keep-Alive verified: {downloaded_bytes:,} of {file_size:,} bytes received (100%). "
                   f"SHA-256 matched: {actual_sha256}. {counter_note} "
-                  "Pixeldrain's expiry extension is limited to once per 24 hours."
+                  "The browser viewer and visible Download control were used; Pixeldrain expiry extension is limited to once per 24 hours."
               )
               return {
                   "file_name": file_name,
@@ -837,12 +980,21 @@ jobs:
                   "downloads_before": downloads_before,
                   "downloads_after": downloads_after,
                   "counter_incremented": counter_incremented,
+                  "views_before": views_before,
+                  "views_after": views_after,
+                  "views_delta": views_delta,
                   "bandwidth_before": bandwidth_before,
                   "bandwidth_after": bandwidth_after,
                   "bandwidth_delta": bandwidth_delta,
+                  "bandwidth_paid_before": bandwidth_paid_before,
+                  "bandwidth_paid_after": bandwidth_paid_after,
+                  "bandwidth_paid_delta": bandwidth_paid_delta,
                   "min_expiry_bandwidth_delta": min_expiry_bandwidth_delta,
                   "accounting_verified": True,
                   "metadata_after_available": metadata_after_available,
+                  "browser_responses": browser_result.get("responses", []),
+                  "date_last_view_before": date_last_view_before,
+                  "date_last_view_after": date_last_view_after,
                   "info": info_after,
                   "message": message,
               }
@@ -901,6 +1053,10 @@ jobs:
                           "keepalive_counter_incremented": keepalive_result["counter_incremented"],
                           "keepalive_bandwidth_before": keepalive_result["bandwidth_before"],
                           "keepalive_bandwidth_after": keepalive_result["bandwidth_after"],
+                          "keepalive_bandwidth_paid_before": keepalive_result["bandwidth_paid_before"],
+                          "keepalive_bandwidth_paid_after": keepalive_result["bandwidth_paid_after"],
+                          "keepalive_views_before": keepalive_result["views_before"],
+                          "keepalive_views_after": keepalive_result["views_after"],
                           "keepalive_accounting_verified": keepalive_result["accounting_verified"],
                           "keepalive_min_expiry_bandwidth_delta": keepalive_result["min_expiry_bandwidth_delta"],
                           "pd_downloads": max(0, int(info.get("downloads", 0) or 0)),
@@ -2077,5 +2233,4 @@ jobs:
               except Exception as error:
                   print(f"::error::Could not send fallback callback to WordPress: {error}")
           PY
-
 
