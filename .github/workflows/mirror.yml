@@ -605,6 +605,47 @@ jobs:
               return "", ""
 
 
+          def fetch_pixeldrain_account_diagnostics():
+              """Read only non-sensitive Pixeldrain account flags needed to diagnose Keep-Alive."""
+              if not PIXELDRAIN_API:
+                  return {"available": False, "reason": "Pixeldrain API key is not configured."}
+              try:
+                  response = requests.get(
+                      f"https://pixeldrain.com/api/user?clobd_nocache={time.time_ns()}",
+                      auth=("", PIXELDRAIN_API),
+                      headers={
+                          "User-Agent": HEADERS["User-Agent"],
+                          "Accept": "application/json",
+                          "Cache-Control": "no-store, no-cache, max-age=0",
+                          "Pragma": "no-cache",
+                      },
+                      timeout=(20, 45),
+                  )
+                  if response.status_code != 200:
+                      return {
+                          "available": False,
+                          "http_status": int(response.status_code),
+                          "reason": (response.text or "Account API returned no body")[:250],
+                      }
+                  account = response.json()
+                  if not isinstance(account, dict):
+                      return {"available": False, "reason": "Unexpected account API response."}
+                  subscription = account.get("subscription") if isinstance(account.get("subscription"), dict) else {}
+                  # Deliberately exclude username, e-mail, account ID, balances and API key.
+                  return {
+                      "available": True,
+                      "subscription_id": str(subscription.get("id", "") or "")[:80],
+                      "subscription_name": str(subscription.get("name", "") or "")[:80],
+                      "subscription_file_expiry_days": subscription.get("file_expiry_days"),
+                      "hotlinking_enabled": account.get("hotlinking_enabled"),
+                      "skip_file_viewer": account.get("skip_file_viewer"),
+                      "monthly_transfer_cap": account.get("monthly_transfer_cap"),
+                      "monthly_transfer_used": account.get("monthly_transfer_used"),
+                  }
+              except Exception as error:
+                  return {"available": False, "reason": str(error)[:250]}
+
+
           def fetch_pixeldrain_file_info(file_id, session=None):
               """Fetch authoritative Pixeldrain metadata, bypassing stale HTTP caches."""
               info_url = f"https://pixeldrain.com/api/file/{quote(file_id, safe='')}/info?clobd_nocache={time.time_ns()}"
@@ -645,6 +686,8 @@ jobs:
 
           def perform_pixeldrain_keepalive(file_id):
               """Use a real browser download, verify bytes/hash, and confirm Pixeldrain accounting."""
+              account_diagnostics = fetch_pixeldrain_account_diagnostics()
+              print("::notice title=Pixeldrain Account Diagnostics::" + json.dumps(account_diagnostics, ensure_ascii=False, sort_keys=True))
               info_before = fetch_pixeldrain_file_info(file_id)
               file_size = int(info_before["size"])
               file_name = _safe_local_filename(info_before.get("name")) or f"Pixeldrain-{file_id}"
@@ -680,6 +723,17 @@ jobs:
                       raise RuntimeError("Playwright/Chromium is not installed for this Pixeldrain Keep-Alive run.") from error
 
                   transfer_responses = []
+                  browser_diagnostics = {
+                      "viewer_url": viewer_url,
+                      "navigation_status": None,
+                      "final_url": "",
+                      "title": "",
+                      "body_excerpt": "",
+                      "download_control": {},
+                      "request_failures": [],
+                      "console_errors": [],
+                      "view_preflight": {},
+                  }
                   async with async_playwright() as playwright:
                       browser = await playwright.chromium.launch(
                           headless=True,
@@ -696,17 +750,40 @@ jobs:
                       def _record_response(response):
                           try:
                               parsed = urlparse(response.url)
-                              if (
-                                  parsed.hostname
-                                  and parsed.hostname.lower().endswith("pixeldrain.com")
-                                  and parsed.path.startswith(f"/api/file/{file_id}")
-                                  and not parsed.path.endswith("/info")
-                              ):
-                                  transfer_responses.append({"status": int(response.status), "url": response.url})
+                              if parsed.hostname and parsed.hostname.lower().endswith("pixeldrain.com"):
+                                  if parsed.path.startswith(f"/api/file/{file_id}") and not parsed.path.endswith("/info"):
+                                      headers = response.headers or {}
+                                      transfer_responses.append({
+                                          "status": int(response.status),
+                                          "path": parsed.path,
+                                          "content_type": headers.get("content-type", "")[:100],
+                                          "content_length": headers.get("content-length", "")[:40],
+                                          "content_range": headers.get("content-range", "")[:100],
+                                      })
+                          except Exception:
+                              pass
+
+                      def _record_request_failure(request):
+                          try:
+                              parsed = urlparse(request.url)
+                              if parsed.hostname and parsed.hostname.lower().endswith("pixeldrain.com"):
+                                  browser_diagnostics["request_failures"].append({
+                                      "path": parsed.path[:180],
+                                      "failure": str(request.failure or "unknown")[:180],
+                                  })
+                          except Exception:
+                              pass
+
+                      def _record_console(message):
+                          try:
+                              if message.type == "error" and len(browser_diagnostics["console_errors"]) < 10:
+                                  browser_diagnostics["console_errors"].append(str(message.text)[:220])
                           except Exception:
                               pass
 
                       page.on("response", _record_response)
+                      page.on("requestfailed", _record_request_failure)
+                      page.on("console", _record_console)
                       try:
                           navigation_response = await page.goto(
                               viewer_url,
@@ -717,6 +794,7 @@ jobs:
                               raise RuntimeError(
                                   f"Pixeldrain viewer page returned HTTP {navigation_response.status}."
                               )
+                          browser_diagnostics["navigation_status"] = int(navigation_response.status) if navigation_response is not None else None
                           try:
                               await page.wait_for_load_state("networkidle", timeout=15000)
                           except PlaywrightTimeoutError:
@@ -728,6 +806,12 @@ jobs:
                               body_text = await page.locator("body").inner_text(timeout=10000)
                           except Exception:
                               pass
+                          try:
+                              browser_diagnostics["final_url"] = str(page.url)
+                              browser_diagnostics["title"] = (await page.title())[:180]
+                          except Exception:
+                              pass
+                          browser_diagnostics["body_excerpt"] = re.sub(r"\s+", " ", body_text).strip()[:500]
                           body_lower = body_text.casefold()
                           iframe_challenge = await page.locator(
                               'iframe[src*="recaptcha"], iframe[src*="turnstile"], iframe[src*="captcha"], iframe[title*="captcha" i]'
@@ -761,6 +845,18 @@ jobs:
                                   try:
                                       if await candidate.is_visible() and await candidate.is_enabled():
                                           download_control = candidate
+                                          try:
+                                              browser_diagnostics["download_control"] = await candidate.evaluate(
+                                                  """el => ({
+                                                      tag: el.tagName.toLowerCase(),
+                                                      text: (el.innerText || '').trim().slice(0, 100),
+                                                      aria: (el.getAttribute('aria-label') || '').slice(0, 100),
+                                                      href: (el.getAttribute('href') || '').slice(0, 300),
+                                                      title: (el.getAttribute('title') || '').slice(0, 100)
+                                                  })"""
+                                              )
+                                          except Exception:
+                                              pass
                                           break
                                   except Exception:
                                       continue
@@ -789,9 +885,54 @@ jobs:
                                   f"Page text: {short_text or 'unavailable'}"
                               )
 
+                          # A genuine viewer request should be registered by Pixeldrain as a unique view.
+                          # If the file has zero views and this first viewer visit creates no view/date_last_view
+                          # change, stop before downloading gigabytes that Pixeldrain is not recognizing.
+                          view_preflight_info = info_before
+                          view_preflight_changed = False
+                          if views_before == 0:
+                              for view_attempt in range(5):
+                                  await asyncio.sleep(3)
+                                  try:
+                                      view_preflight_info = fetch_pixeldrain_file_info(file_id)
+                                      current_views = max(0, int(view_preflight_info.get("views", 0) or 0))
+                                      current_last_view = str(view_preflight_info.get("date_last_view", "") or "")
+                                      if current_views > views_before or (
+                                          current_last_view and current_last_view != date_last_view_before
+                                      ):
+                                          view_preflight_changed = True
+                                          break
+                                  except Exception as view_error:
+                                      print(f"::warning title=Pixeldrain Viewer Preflight::{str(view_error)[:250]}")
+                              browser_diagnostics["view_preflight"] = {
+                                  "views_before": views_before,
+                                  "views_after": max(0, int(view_preflight_info.get("views", views_before) or 0)),
+                                  "date_last_view_before": date_last_view_before,
+                                  "date_last_view_after": str(view_preflight_info.get("date_last_view", "") or ""),
+                                  "registered": view_preflight_changed,
+                              }
+                              if not view_preflight_changed:
+                                  diagnostic_log = {
+                                      "account": account_diagnostics,
+                                      "viewer": browser_diagnostics,
+                                  }
+                                  print("::notice title=Pixeldrain Viewer Preflight Diagnostic::" + json.dumps(diagnostic_log, ensure_ascii=False, sort_keys=True)[:3500])
+                                  raise RuntimeError(
+                                      "Pixeldrain opened the viewer page, but the first viewer visit was not registered "
+                                      "(views remained 0 and date_last_view did not change). The 100% file download was "
+                                      "SKIPPED to avoid another unnecessary large transfer. This points to Pixeldrain "
+                                      "not accepting the GitHub Runner's viewer request, or to an account/plan/viewer setting. "
+                                      f"Sanitized diagnostics: {json.dumps(diagnostic_log, ensure_ascii=False, sort_keys=True)[:2500]}"
+                                  )
+                          else:
+                              browser_diagnostics["view_preflight"] = {
+                                  "views_before": views_before,
+                                  "registered": "not_tested_existing_unique_views",
+                              }
+
                           update_progress(
                               "downloading",
-                              "Pixeldrain viewer opened in Chromium. Clicking its visible Download control and receiving the complete original file.",
+                              "Pixeldrain viewer visit was registered. Clicking its visible Download control and receiving the complete original file.",
                               file_name,
                           )
                           try:
@@ -822,6 +963,7 @@ jobs:
                               "suggested_filename": browser_download.suggested_filename,
                               "responses": transfer_responses,
                               "page_text": re.sub(r"\s+", " ", body_text).strip()[:500],
+                              "diagnostics": browser_diagnostics,
                           }
                       finally:
                           await context.close()
@@ -959,7 +1101,9 @@ jobs:
                       f"bandwidth_used delta {bandwidth_delta:,} bytes; bandwidth_used_paid delta {bandwidth_paid_delta:,} bytes; "
                       f"required bandwidth increase: at least {min_expiry_bandwidth_delta:,} bytes). "
                       "Keep-Alive was NOT marked successful. The viewer page and its visible Download control were used; "
-                      "if counters still do not move, Pixeldrain may be excluding this runner/account transfer or applying an account/plan restriction."
+                      "if counters still do not move, Pixeldrain may be excluding this runner/account transfer or applying an account/plan restriction. "
+                      f"Sanitized account diagnostics: {json.dumps(account_diagnostics, ensure_ascii=False, sort_keys=True)}. "
+                      f"Browser diagnostics: {json.dumps(browser_result.get('diagnostics', {}), ensure_ascii=False, sort_keys=True)[:1800]}"
                   )
 
               result_url = f"https://pixeldrain.com/u/{quote(file_id, safe='')}"
@@ -993,6 +1137,8 @@ jobs:
                   "accounting_verified": True,
                   "metadata_after_available": metadata_after_available,
                   "browser_responses": browser_result.get("responses", []),
+                  "browser_diagnostics": browser_result.get("diagnostics", {}),
+                  "account_diagnostics": account_diagnostics,
                   "date_last_view_before": date_last_view_before,
                   "date_last_view_after": date_last_view_after,
                   "info": info_after,
