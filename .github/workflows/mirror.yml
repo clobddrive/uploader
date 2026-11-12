@@ -100,7 +100,6 @@ jobs:
           import re
           import subprocess
           import tempfile
-          from pathlib import Path
           from urllib.parse import quote, unquote
           from email.message import Message
 
@@ -173,6 +172,9 @@ jobs:
 
           def find_wordpress_duplicate(file_name):
               """Use exact filename plus provider-specific successful queue history."""
+              if PLATFORM in ("gofile", "buzzheavier", "fuckingfast"):
+                  print(f"::notice title=Fresh Upload Mode::Bypassing prior {PLATFORM} duplicate history for {file_name}")
+                  return ""
               if FORCE_UPLOAD:
                   print(f"::notice title=Forced Re-upload::Bypassing prior {PLATFORM} filename history for {file_name}")
                   return ""
@@ -263,151 +265,78 @@ jobs:
               return value
 
           def download_from_google_cloud_fast(fallback_info, download_dir):
-              """Download a signed Worker URL with resumable Range retries and exact byte-count checks."""
+              """Stream the saved Cloudflare Worker URL to disk without buffering the file in RAM."""
               fallback_url = fallback_info["fallback_url"]
               expected_name = _safe_local_filename(fallback_info.get("file_name"))
               part_path = os.path.join(download_dir, f".clobd-fallback-{JOB_ID}.part")
-              final_path = ""
-              expected_total = 0
-              file_name = expected_name
-              etag = ""
-              last_modified = ""
-              last_error = None
+              total_written = 0
+              expected_content_length = 0
               last_progress_time = 0.0
               last_progress_bytes = 0
-
-              for attempt in range(1, 6):
-                  offset = os.path.getsize(part_path) if os.path.isfile(part_path) else 0
-                  request_headers = {"User-Agent": HEADERS["User-Agent"], "Accept": "*/*"}
-                  if offset > 0:
-                      request_headers["Range"] = f"bytes={offset}-"
-                      if etag:
-                          request_headers["If-Range"] = etag
-                      elif last_modified:
-                          request_headers["If-Range"] = last_modified
-
-                  try:
-                      with requests.get(
-                          fallback_url,
-                          headers=request_headers,
-                          stream=True,
-                          allow_redirects=True,
-                          timeout=(30, 300),
-                      ) as response:
-                          if response.status_code == 416 and expected_total > 0 and offset == expected_total:
-                              final_path = os.path.join(download_dir, file_name or expected_name)
-                              os.replace(part_path, final_path)
-                              return final_path
-                          if response.status_code not in (200, 206):
-                              raise RuntimeError(f"Google Cloud (Fast) download failed (HTTP {response.status_code}): {response.text[:500]}")
-                          from urllib.parse import urlparse
-                          if urlparse(response.url).scheme != "https":
-                              raise RuntimeError("Google Cloud (Fast) redirected to a non-HTTPS address. Download was blocked for security.")
-
-                          content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
-                          response_etag = str(response.headers.get("ETag", "")).strip()
-                          response_last_modified = str(response.headers.get("Last-Modified", "")).strip()
-                          if response_etag:
-                              etag = response_etag
-                          if response_last_modified:
-                              last_modified = response_last_modified
-
-                          if response.status_code == 206:
-                              content_range = str(response.headers.get("Content-Range", "")).strip()
-                              match = re.match(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$", content_range, re.I)
-                              if match:
-                                  range_start = int(match.group(1))
-                                  if range_start != offset:
-                                      raise RuntimeError(f"Google Cloud (Fast) returned an unexpected resume offset ({range_start}; expected {offset}).")
-                                  if match.group(3) != "*":
-                                      expected_total = int(match.group(3))
-                              else:
-                                  try:
-                                      remaining_length = int(response.headers.get("Content-Length", "0") or 0)
-                                  except (TypeError, ValueError):
-                                      remaining_length = 0
-                                  if remaining_length > 0:
-                                      expected_total = offset + remaining_length
-                          else:
-                              # The Worker ignored Range. Start cleanly rather than
-                              # appending a second full copy to the partial file.
-                              offset = 0
-                              try:
-                                  expected_total = int(response.headers.get("Content-Length", "0") or 0)
-                              except (TypeError, ValueError):
-                                  expected_total = 0
-
-                          header_name = _safe_local_filename(_filename_from_content_disposition(response.headers.get("Content-Disposition", "")))
-                          file_name = expected_name or file_name or header_name
-                          if not file_name:
-                              raise RuntimeError("Google Cloud (Fast) did not provide a filename, and the WordPress File post has no usable source filename.")
-                          if content_type in ("text/html", "application/json"):
-                              raise RuntimeError(f"Google Cloud (Fast) returned {content_type} instead of the file. The signed Worker URL may have expired or returned an error page.")
-
-                          chunk_iterator = iter(response.iter_content(chunk_size=8 * 1024 * 1024))
-                          first_chunk = next(chunk_iterator, b"")
-                          preview = (first_chunk or b"").lstrip()[:160].lower()
-                          looks_like_error_document = preview.startswith((b"<!doctype html", b"<html", b"{\"error\"", b"{\n  \"error\"", b"{\"success\":false", b"[\"error\""))
-                          if looks_like_error_document:
-                              raise RuntimeError("Google Cloud (Fast) returned an error document instead of the file stream.")
-
-                          open_mode = "ab" if offset > 0 else "wb"
-                          with open(part_path, open_mode) as output:
-                              if first_chunk:
-                                  output.write(first_chunk)
-                              total_written = offset + len(first_chunk or b"")
-                              for chunk in chunk_iterator:
-                                  if not chunk:
-                                      continue
-                                  output.write(chunk)
-                                  total_written += len(chunk)
-                                  now = time.time()
-                                  if total_written - last_progress_bytes >= 64 * 1024 * 1024 or now - last_progress_time >= 30:
-                                      last_progress_bytes = total_written
-                                      last_progress_time = now
-                                      if expected_total > 0:
-                                          percent = min(99, int((total_written / expected_total) * 100))
-                                          message = f"Downloading from Google Cloud (Fast) ({percent}% · {total_written / (1024 ** 2):.0f} MiB)."
-                                      else:
-                                          message = f"Downloading from Google Cloud (Fast) ({total_written / (1024 ** 2):.0f} MiB received)."
-                                      update_progress("downloading_fallback", message, file_name)
-                              output.flush()
-                              os.fsync(output.fileno())
-
-                      actual_size = os.path.getsize(part_path) if os.path.isfile(part_path) else 0
-                      if actual_size <= 0:
-                          raise RuntimeError("Google Cloud (Fast) returned an empty file. Upload cancelled.")
-                      if expected_total > 0 and actual_size != expected_total:
-                          raise RuntimeError(f"Google Cloud (Fast) stream was interrupted: expected {expected_total} bytes, received {actual_size} bytes.")
-
-                      final_path = os.path.join(download_dir, file_name)
-                      os.replace(part_path, final_path)
-                      print(f"::notice title=Google Cloud (Fast) Download Verified::Downloaded {actual_size} bytes after {attempt} attempt(s).")
-                      return final_path
-
-                  except Exception as download_error:
-                      last_error = download_error
-                      actual_partial = os.path.getsize(part_path) if os.path.isfile(part_path) else 0
-                      if expected_total > 0 and actual_partial > expected_total:
-                          try:
-                              os.remove(part_path)
-                          except OSError:
-                              pass
-                          actual_partial = 0
-                      if attempt < 5:
-                          retry_message = f"Google Cloud (Fast) connection was interrupted ({actual_partial / (1024 ** 2):.0f} MiB saved). Resuming/retrying download ({attempt + 1}/5)."
-                          print(f"::warning title=Google Cloud (Fast) Retry::{download_error} {retry_message}")
-                          update_progress("downloading_fallback", retry_message, file_name)
-                          time.sleep(min(20, 4 * attempt))
-                          continue
+              try:
+                  with requests.get(
+                      fallback_url,
+                      headers={"User-Agent": HEADERS["User-Agent"], "Accept": "*/*"},
+                      stream=True,
+                      allow_redirects=True,
+                      timeout=(30, 300),
+                  ) as response:
+                      if response.status_code != 200:
+                          raise RuntimeError(f"Google Cloud (Fast) download failed (HTTP {response.status_code}): {response.text[:500]}")
+                      from urllib.parse import urlparse
+                      if urlparse(response.url).scheme != "https":
+                          raise RuntimeError("Google Cloud (Fast) redirected to a non-HTTPS address. Download was blocked for security.")
+                      content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
                       try:
-                          if os.path.exists(part_path):
-                              os.remove(part_path)
-                      except OSError:
-                          pass
-                      raise RuntimeError(f"Google Cloud (Fast) download failed after 5 resumable attempts: {last_error}") from download_error
+                          expected_content_length = int(response.headers.get("Content-Length", "0") or 0)
+                      except (TypeError, ValueError):
+                          expected_content_length = 0
+                      header_name = _safe_local_filename(_filename_from_content_disposition(response.headers.get("Content-Disposition", "")))
+                      file_name = expected_name or header_name
+                      if not file_name:
+                          raise RuntimeError("Google Cloud (Fast) did not provide a filename, and the WordPress File post has no usable source filename.")
 
-              raise RuntimeError(f"Google Cloud (Fast) download did not complete: {last_error or 'unknown stream error'}")
+                      chunk_iterator = iter(response.iter_content(chunk_size=8 * 1024 * 1024))
+                      first_chunk = next(chunk_iterator, b"")
+                      preview = (first_chunk or b"").lstrip()[:160].lower()
+                      looks_like_error_document = preview.startswith((b"<!doctype html", b"<html", b"{\"error\"", b"{\n  \"error\"", b"{\"success\":false", b"[\"error\""))
+                      if content_type in ("text/html", "application/json") or looks_like_error_document:
+                          raise RuntimeError(f"Google Cloud (Fast) returned an HTML/JSON response instead of the file ({content_type or 'unknown content type'}). The signed Worker URL may have expired or returned an error page.")
+
+                      with open(part_path, "wb") as output:
+                          if first_chunk:
+                              output.write(first_chunk)
+                              total_written += len(first_chunk)
+                          for chunk in chunk_iterator:
+                              if not chunk:
+                                  continue
+                              output.write(chunk)
+                              total_written += len(chunk)
+                              now = time.time()
+                              if total_written - last_progress_bytes >= 64 * 1024 * 1024 or now - last_progress_time >= 30:
+                                  last_progress_bytes = total_written
+                                  last_progress_time = now
+                                  if expected_content_length > 0:
+                                      percent = min(99, int((total_written / expected_content_length) * 100))
+                                      message = f"Downloading from Google Cloud (Fast) ({percent}% · {total_written / (1024 ** 2):.0f} MiB)."
+                                  else:
+                                      message = f"Downloading from Google Cloud (Fast) ({total_written / (1024 ** 2):.0f} MiB received)."
+                                  update_progress("downloading_fallback", message, file_name)
+
+                  if total_written <= 0 or not os.path.isfile(part_path):
+                      raise RuntimeError("Google Cloud (Fast) returned an empty file. Upload cancelled.")
+                  if expected_content_length > 0 and total_written != expected_content_length:
+                      raise RuntimeError(f"Google Cloud (Fast) download was incomplete: expected {expected_content_length} bytes, received {total_written} bytes.")
+                  final_path = os.path.join(download_dir, file_name)
+                  os.replace(part_path, final_path)
+                  return final_path
+              except Exception:
+                  try:
+                      if os.path.exists(part_path):
+                          os.remove(part_path)
+                  except OSError:
+                      pass
+                  raise
 
           def download_from_pixeldrain_fallback(fallback_info, download_dir):
               """Download the source file from Pixeldrain (Super Fast) when Google Drive and Google Cloud (Fast) are unavailable."""
@@ -767,20 +696,12 @@ jobs:
               else:
                   update_progress("downloading", "Downloading the source file from Google Drive.")
                   drive_url = f"https://drive.google.com/uc?id={GDRIVE_ID}"
-                  for drive_attempt in range(1, 4):
-                      try:
-                          downloaded_path = gdown.download(drive_url, quiet=False)
-                          if downloaded_path and os.path.isfile(downloaded_path) and os.path.getsize(downloaded_path) > 0:
-                              gdrive_failure_reason = ""
-                              break
-                          gdrive_failure_reason = "gdown did not return a complete local file (the file may be disabled, deleted, or quota-limited on Google Drive)."
-                      except Exception as gdrive_error:
-                          gdrive_failure_reason = str(gdrive_error) or gdrive_error.__class__.__name__
-                      downloaded_path = ""
-                      if drive_attempt < 3:
-                          print(f"::warning title=Google Drive Retry::{gdrive_failure_reason} Retrying Google Drive download ({drive_attempt + 1}/3).")
-                          update_progress("downloading", f"Google Drive download was interrupted. Retrying ({drive_attempt + 1}/3).")
-                          time.sleep(5 * drive_attempt)
+                  try:
+                      downloaded_path = gdown.download(drive_url, quiet=False)
+                      if not downloaded_path or not os.path.isfile(downloaded_path):
+                          gdrive_failure_reason = "gdown did not return a local file (file may be disabled, deleted, or quota-limited on Google Drive)."
+                  except Exception as gdrive_error:
+                      gdrive_failure_reason = str(gdrive_error) or gdrive_error.__class__.__name__
 
               if not downloaded_path or not os.path.isfile(downloaded_path):
                   print(f"::warning title=Google Drive Source Unavailable::Google Drive download did not succeed ({gdrive_failure_reason}). Requesting fallback sources from WordPress.")
@@ -822,11 +743,11 @@ jobs:
               print(f"::notice title=Downloaded::{file_name} | {file_size_gb} GiB")
 
               if PLATFORM in ("gofile", "buzzheavier", "fuckingfast"):
-                  # These providers must always receive a fresh upload. Do not reuse
-                  # WordPress queue history or an older provider URL: old links may
-                  # be deleted/expired even when the filename is identical.
-                  update_progress("checking_account", f"{PLATFORM.title()}: bypassing all filename/history duplicate checks and preparing a fresh upload.", file_name)
-                  print(f"::notice title=Fresh Provider Upload::{PLATFORM} duplicate checks are disabled; uploading a new copy of {file_name}.")
+                  # Gofile, BUZZHEAVIER, and FUCKINGFAST must always perform a
+                  # fresh upload without duplicate checks, even if the same
+                  # file was uploaded multiple times before.
+                  update_progress("checking_account", f"{PLATFORM.upper()}: bypassing duplicate checks and preparing a fresh upload.", file_name)
+                  print(f"::notice title={PLATFORM.upper()} Fresh Upload::Skipping WordPress filename/history duplicate checks for {file_name}.")
                   existing_url = ""
               else:
                   update_progress("checking_duplicate", f"Checking {PLATFORM} for an exact filename match.", file_name)
@@ -874,36 +795,30 @@ jobs:
                   message = f"Pixeldrain upload completed successfully. File size: {file_size_gb} GiB."
 
               elif PLATFORM == "gofile":
-                  # Omitting folderId makes Gofile create a fresh public folder
-                  # for this upload, so identical filenames do not collide.
+                  # Always perform a fresh upload to Gofile with the exact original
+                  # filename (no duplicate checks and no filename suffixes).
                   from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
                   from urllib.parse import urlparse
-                  last_gofile_error = None
-                  gofile_uploaded = False
-                  browser_headers = {
-                      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                      "Accept-Language": "en-US,en;q=0.9",
-                  }
 
-                  for gofile_attempt in range(1, 6):
-                      last_progress_bytes = [0]
-                      last_progress_time = [0.0]
+                  gofile_last_error = None
+                  result_url = ""
+                  for gofile_attempt in range(1, 4):
                       try:
-                          update_progress("uploading", f"Uploading a fresh Gofile copy of {file_name} ({file_size_gb} GiB), attempt {gofile_attempt}/5.", file_name)
+                          attempt_note = f" (attempt {gofile_attempt}/3)" if gofile_attempt > 1 else ""
+                          update_progress("uploading", f"Streaming {file_name} ({file_size_gb} GiB) to Gofile{attempt_note}.", file_name)
+                          last_progress_bytes = [0]
+                          last_progress_time = [0.0]
                           with open(file_path, "rb") as file_handle:
                               encoder = MultipartEncoder(fields={
                                   "file": (file_name, file_handle, "application/octet-stream"),
                               })
-
                               def report_gofile_progress(monitor):
                                   now = time.time()
                                   if (monitor.bytes_read - last_progress_bytes[0] >= 32 * 1024 * 1024) or (now - last_progress_time[0] >= 30):
                                       last_progress_bytes[0] = monitor.bytes_read
                                       last_progress_time[0] = now
                                       percent = min(99, int((monitor.bytes_read / max(1, monitor.len)) * 100))
-                                      update_progress("uploading", f"Uploading {file_name} to Gofile ({percent}% sent · attempt {gofile_attempt}/5).", file_name)
-
+                                      update_progress("uploading", f"Uploading {file_name} to Gofile ({percent}% sent{attempt_note}).", file_name)
                               monitor = MultipartEncoderMonitor(encoder, report_gofile_progress)
                               gofile_headers = dict(HEADERS)
                               gofile_headers["Authorization"] = f"Bearer {GOFILE_API_TOKEN}"
@@ -914,571 +829,116 @@ jobs:
                                   headers=gofile_headers,
                                   timeout=(30, 7200),
                               )
-
                           try:
                               upload_data = upload_response.json()
                           except ValueError as error:
                               raise RuntimeError(f"Gofile returned invalid JSON (HTTP {upload_response.status_code}): {upload_response.text[:1000]}") from error
-
-                          api_status = str(upload_data.get("status", "")).strip().casefold() if isinstance(upload_data, dict) else "unknown"
-                          if upload_response.status_code not in (200, 201) or not isinstance(upload_data, dict) or api_status != "ok":
-                              detail = upload_response.text[:1200] if upload_response.text else str(upload_data)[:1200]
-                              retryable = upload_response.status_code in (408, 409, 425, 429, 500, 502, 503, 504) or api_status in ("error-ratelimit", "error-server", "error-temporary") or "already exists" in detail.casefold() or "file exists" in detail.casefold() or "duplicate" in detail.casefold()
-                              raise RuntimeError(f"Gofile upload failed (HTTP {upload_response.status_code}, status {api_status}): {detail}" + (" [retryable]" if retryable else ""))
-
+                          if upload_response.status_code not in (200, 201) or not isinstance(upload_data, dict) or upload_data.get("status") != "ok":
+                              error_status = upload_data.get("status") if isinstance(upload_data, dict) else "unknown"
+                              raise RuntimeError(f"Gofile upload failed (HTTP {upload_response.status_code}, status {error_status}): {upload_response.text[:1200]}")
                           data = upload_data.get("data") if isinstance(upload_data.get("data"), dict) else {}
-                          uploaded_name = str(data.get("name") or "")
-                          uploaded_id = str(data.get("id") or "").strip()
+                          candidate_url = str(data.get("downloadPage") or "").strip()
+                          if not candidate_url and data.get("code"):
+                              candidate_url = f"https://gofile.io/d/{data['code']}"
+                          if not candidate_url.startswith("https://gofile.io/"):
+                              raise RuntimeError("Gofile reported success but did not return a valid public downloadPage URL.")
+
+                          # Probe the public Gofile share link to make sure it is not 404/410.
                           try:
-                              uploaded_size = int(data.get("size") or 0)
-                          except (TypeError, ValueError):
-                              uploaded_size = 0
-                          if not uploaded_id:
-                              raise RuntimeError("Gofile reported success but did not return a file ID.")
-                          if uploaded_name != file_name:
-                              raise RuntimeError(f"Gofile uploaded an unexpected filename. Expected the exact original name '{file_name}', received '{uploaded_name or 'no name'}'.")
-                          if uploaded_size != file_size:
-                              raise RuntimeError(f"Gofile upload size verification failed: expected {file_size} bytes, received {uploaded_size} bytes.")
+                              with requests.get(
+                                  candidate_url,
+                                  headers={
+                                      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                  },
+                                  stream=True,
+                                  allow_redirects=True,
+                                  timeout=(20, 45),
+                              ) as gf_probe:
+                                  if int(gf_probe.status_code) in (404, 410):
+                                      raise RuntimeError(f"Gofile public link returned HTTP {gf_probe.status_code}.")
+                          except requests.RequestException as probe_err:
+                              print(f"::warning title=Gofile Public Link Probe::Probe inconclusive ({probe_err}); keeping verified API URL {candidate_url}.")
 
-                          result_url = str(data.get("downloadPage") or "").strip()
-                          if not result_url and data.get("code"):
-                              result_url = f"https://gofile.io/d/{quote(str(data['code']), safe='')}"
-                          parsed_gofile_url = urlparse(result_url)
-                          if parsed_gofile_url.scheme != "https" or parsed_gofile_url.hostname not in ("gofile.io", "www.gofile.io"):
-                              raise RuntimeError("Gofile reported success but did not return an official HTTPS public download page URL.")
-
-                          # The API response confirms file ID, exact name and bytes.
-                          # Also make a lightweight request to the actual public page.
-                          with requests.get(
-                              result_url,
-                              headers=browser_headers,
-                              stream=True,
-                              allow_redirects=True,
-                              timeout=(20, 60),
-                          ) as link_response:
-                              if link_response.status_code not in (200, 206):
-                                  raise RuntimeError(f"Gofile public link verification failed (HTTP {link_response.status_code}); the URL was not saved.")
-                              final_url = urlparse(link_response.url)
-                              if final_url.scheme != "https" or not final_url.hostname or not (final_url.hostname == "gofile.io" or final_url.hostname.endswith(".gofile.io")):
-                                  raise RuntimeError("Gofile public page redirected outside its official HTTPS domain; the URL was not saved.")
-                              preview = bytearray()
-                              for chunk in link_response.iter_content(chunk_size=4096):
-                                  if chunk:
-                                      preview.extend(chunk[:4096])
-                                  if len(preview) >= 8192:
-                                      break
-                              preview_text = bytes(preview).decode("utf-8", errors="ignore").casefold()
-                              if any(marker in preview_text for marker in ("file not found", "this file was deleted", "file is unavailable", "content not found")):
-                                  raise RuntimeError("Gofile public page reports that the uploaded content is unavailable; the URL was not saved.")
-
-                          message = f"Gofile upload completed and verified: exact filename and {uploaded_size} bytes. Fresh public folder; upload attempt {gofile_attempt}/5."
-                          gofile_uploaded = True
+                          result_url = candidate_url
                           break
+                      except Exception as gf_err:
+                          gofile_last_error = gf_err
+                          print(f"::warning title=Gofile Upload Attempt {gofile_attempt}::{gf_err}")
+                          if gofile_attempt < 3:
+                              time.sleep(10)
+                  if not result_url:
+                      raise RuntimeError(f"Gofile upload failed after 3 attempts: {gofile_last_error}")
+                  message = f"Gofile fresh upload completed successfully (exact original filename preserved). File size: {file_size_gb} GiB."
 
-                      except Exception as gofile_error:
-                          last_gofile_error = gofile_error
-                          err_text = str(gofile_error).casefold()
-                          retryable = isinstance(gofile_error, requests.RequestException) or "[retryable]" in err_text or any(token in err_text for token in ("connection reset", "connection aborted", "read timed out", "timed out", "incomplete read", "temporarily unavailable"))
-                          if not retryable or gofile_attempt >= 5:
-                              raise RuntimeError(f"Gofile upload/verification failed on attempt {gofile_attempt}/5: {gofile_error}") from gofile_error
-                          update_progress("uploading", f"Gofile upload was interrupted or the provider reported a duplicate. Starting a new isolated upload ({gofile_attempt + 1}/5).", file_name)
-                          print(f"::warning title=Gofile Upload Retry::{gofile_error}; retrying with a fresh upload request and new public folder.")
-                          time.sleep(min(60, 10 * gofile_attempt))
+              elif PLATFORM in ("buzzheavier", "fuckingfast"):
+                  # Authenticated account upload for BUZZHEAVIER and FUCKINGFAST.
+                  # Both providers share the same File Manager & Upload API architecture:
+                  # - GET  https://{domain}/api/fs
+                  # - POST https://{domain}/api/fs/{parentDirectoryId}
+                  # - GET  https://{domain}/api/fs/{directoryId}
+                  # - PATCH https://{domain}/api/fs/{fileId}
+                  # - GET  https://{domain}/api/locations
+                  # - PUT  https://w.{domain}/{parentId}/{name}?locationId={locationId}
+                  #
+                  # To allow unlimited re-uploads of the exact same file without
+                  # EVER hitting HTTP 400 {"code":400,"error":"file already exists with the same name"}
+                  # and without EVER adding 1, 2 suffixes to the filename:
+                  # 1. Never scan the account root for duplicate filenames.
+                  # 2. Create a fresh, isolated directory for each upload attempt.
+                  # 3. Upload the file into that isolated directory with no suffix.
+                  # 4. Verify the uploaded file ID and exact byte size inside the isolated directory.
+                  is_buzz = (PLATFORM == "buzzheavier")
+                  provider_label = "BUZZHEAVIER" if is_buzz else "FUCKINGFAST"
+                  provider_domain = "buzzheavier.com" if is_buzz else "fuckingfast.net"
+                  provider_region = BUZZHEAVIER_REGION if is_buzz else FUCKINGFAST_REGION
+                  provider_account_id = BUZZHEAVIER_ACCOUNT_ID if is_buzz else FUCKINGFAST_ACCOUNT_ID
 
-                  if not gofile_uploaded:
-                      raise RuntimeError(f"Gofile upload failed after 5 attempts: {last_gofile_error or 'unknown error'}")
-
-              elif PLATFORM == "buzzheavier":
-                  # Every queue job gets a new BUZZHEAVIER directory. This allows
-                  # the same filename to be uploaded again without touching or
-                  # reusing an older file in the account root.
                   allowed_regions = {
                       "Asia-Pacific", "Western Europe", "Eastern Europe",
                       "Central Europe", "Eastern US", "Western US",
                   }
-                  if BUZZHEAVIER_REGION not in allowed_regions:
-                      raise RuntimeError(f"Unsupported BUZZHEAVIER storage region: {BUZZHEAVIER_REGION}")
-                  if not BUZZHEAVIER_ACCOUNT_ID:
-                      raise RuntimeError("BUZZHEAVIER_ACCOUNT_ID GitHub Actions secret is missing.")
-                  buzz_upload_name = file_name  # Final stored name must remain byte-for-byte identical.
-                  if not buzz_upload_name or len(buzz_upload_name) > 500:
-                      raise RuntimeError(f"BUZZHEAVIER requires a non-empty filename of at most 500 characters; received {len(buzz_upload_name)} characters.")
+                  if provider_region not in allowed_regions:
+                      raise RuntimeError(f"Unsupported {provider_label} storage region: {provider_region}")
+                  if not provider_account_id:
+                      raise RuntimeError(f"{provider_label}_ACCOUNT_ID GitHub Actions secret is missing.")
 
-                  buzz_auth_headers = dict(HEADERS)
-                  buzz_auth_headers["Authorization"] = f"Bearer {BUZZHEAVIER_ACCOUNT_ID}"
-                  update_progress("checking_account", "Authenticating with BUZZHEAVIER and resolving the account root directory.", file_name)
-                  root_response = requests.get("https://buzzheavier.com/api/fs", headers=buzz_auth_headers, timeout=(20, 90))
-                  if root_response.status_code != 200:
-                      raise RuntimeError(f"BUZZHEAVIER File Manager root lookup failed (HTTP {root_response.status_code}): {root_response.text[:700]}")
-                  try:
-                      root_payload = root_response.json()
-                  except ValueError as error:
-                      raise RuntimeError("BUZZHEAVIER File Manager returned invalid JSON for the root directory.") from error
-                  if not isinstance(root_payload, dict):
-                      raise RuntimeError("BUZZHEAVIER File Manager returned an unexpected root-directory response.")
-
-                  def _buzz_scalar_id(value):
-                      return isinstance(value, (str, int)) and str(value).strip() != ""
-
-                  def _buzz_walk_dicts(value, depth=0):
-                      if depth > 10:
-                          return
-                      if isinstance(value, dict):
-                          yield value
-                          for child in value.values():
-                              if isinstance(child, (dict, list)):
-                                  yield from _buzz_walk_dicts(child, depth + 1)
-                      elif isinstance(value, list):
-                          for child in value:
-                              if isinstance(child, (dict, list)):
-                                  yield from _buzz_walk_dicts(child, depth + 1)
-
-                  def _buzz_find_root_id(payload):
-                      preferred = ("rootId", "rootDirectoryId", "directoryId", "parentId", "folderId", "root_id", "parent_id")
-                      containers = list(_buzz_walk_dicts(payload))
-                      for container in containers:
-                          for key in preferred:
-                              value = container.get(key)
-                              if _buzz_scalar_id(value):
-                                  return str(value).strip()
-                      for container in containers:
-                          has_contents = any(key in container for key in ("files", "folders", "directories", "items", "children", "contents"))
-                          is_root = any(key in container for key in ("root", "rootDirectory", "currentDirectory", "directory"))
-                          if has_contents or is_root:
-                              for key in ("id", "_id"):
-                                  if _buzz_scalar_id(container.get(key)):
-                                      return str(container[key]).strip()
-                      return ""
-
-                  root_directory_id = _buzz_find_root_id(root_payload)
-                  if not root_directory_id:
-                      raise RuntimeError("BUZZHEAVIER authenticated root response did not expose a root directory ID; upload stopped safely.")
-
-                  locations_response = requests.get("https://buzzheavier.com/api/locations", headers=HEADERS, timeout=(20, 60))
-                  locations_response.raise_for_status()
-                  try:
-                      locations_data = locations_response.json()
-                  except ValueError as error:
-                      raise RuntimeError("BUZZHEAVIER locations API returned invalid JSON.") from error
-                  location_rows = locations_data.get("data") if isinstance(locations_data, dict) else None
-                  if not isinstance(location_rows, list):
-                      raise RuntimeError("BUZZHEAVIER locations API did not return a valid data array.")
-                  location_id = ""
-                  for location in location_rows:
-                      if isinstance(location, dict) and str(location.get("name", "")).strip().casefold() == BUZZHEAVIER_REGION.casefold():
-                          location_id = str(location.get("id", "")).strip()
-                          break
-                  if not location_id:
-                      available = ", ".join(str(item.get("name", "")) for item in location_rows if isinstance(item, dict))
-                      raise RuntimeError(f"BUZZHEAVIER region '{BUZZHEAVIER_REGION}' was not returned by the locations API. Available: {available or 'none'}")
-
-                  def _buzz_create_directory(upload_attempt):
-                      folder_name = f"CLOBD-P{POST_ID}-J{JOB_ID}-R{RUN_ID or 'local'}-A{RUN_ATTEMPT}-T{upload_attempt}"
-                      folder_response = requests.post(
-                          f"https://buzzheavier.com/api/fs/{quote(root_directory_id, safe='')}",
-                          headers={**buzz_auth_headers, "Content-Type": "application/json"},
-                          json={"name": folder_name},
-                          timeout=(20, 90),
-                      )
-                      if folder_response.status_code not in (200, 201):
-                          raise RuntimeError(f"BUZZHEAVIER could not create an isolated upload directory (HTTP {folder_response.status_code}): {folder_response.text[:900]}")
-                      try:
-                          payload = folder_response.json()
-                      except ValueError as error:
-                          raise RuntimeError("BUZZHEAVIER returned invalid JSON after creating an upload directory.") from error
-                      for item in _buzz_walk_dicts(payload):
-                          if str(item.get("name", "")).strip() == folder_name:
-                              for key in ("id", "directoryId", "folderId", "folder_id", "_id"):
-                                  if _buzz_scalar_id(item.get(key)):
-                                      return str(item[key]).strip(), folder_name
-                      for item in _buzz_walk_dicts(payload):
-                          for key in ("id", "directoryId", "folderId", "folder_id", "_id"):
-                              if _buzz_scalar_id(item.get(key)) and str(item[key]).strip() != root_directory_id:
-                                  return str(item[key]).strip(), folder_name
-                      raise RuntimeError("BUZZHEAVIER created an upload directory but did not return its directory ID.")
-
-                  def _buzz_walk_files(value, depth=0):
-                      if depth > 10:
-                          return
-                      if isinstance(value, dict):
-                          name = value.get("name") or value.get("filename")
-                          item_id = value.get("id") or value.get("fileId") or value.get("file_id")
-                          kind = str(value.get("type") or value.get("kind") or "").casefold()
-                          is_directory = value.get("isDirectory") is True or value.get("is_dir") is True or kind in ("directory", "folder", "dir")
-                          if isinstance(name, str) and _buzz_scalar_id(item_id) and not is_directory:
-                              yield name, str(item_id).strip(), value
-                          for key in ("data", "files", "folders", "directories", "items", "children", "contents", "result"):
-                              if key in value:
-                                  yield from _buzz_walk_files(value[key], depth + 1)
-                      elif isinstance(value, list):
-                          for child in value:
-                              yield from _buzz_walk_files(child, depth + 1)
-
-                  def _buzz_curl_upload(parent_id, remote_name, upload_attempt):
-                      config_path = ""
-                      response_path = ""
-                      try:
-                          config_fd, config_path = tempfile.mkstemp(prefix="clobd-buzzheavier-", suffix=".curl")
-                          os.chmod(config_path, 0o600)
-                          safe_account_id = BUZZHEAVIER_ACCOUNT_ID.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
-                          with os.fdopen(config_fd, "w", encoding="utf-8") as config_file:
-                              config_file.write(f'header = "Authorization: Bearer {safe_account_id}"\n')
-                              config_file.write('header = "Content-Type: application/octet-stream"\n')
-                          response_fd, response_path = tempfile.mkstemp(prefix="clobd-buzzheavier-response-", suffix=".json")
-                          os.close(response_fd)
-                          upload_url = f"https://w.buzzheavier.com/{quote(parent_id, safe='')}/{quote(remote_name, safe='')}?{urlencode({'locationId': location_id})}"
-                          curl_command = [
-                              "curl", "--http1.1", "--show-error", "--progress-bar",
-                              "--connect-timeout", "60", "--max-time", "7200", "--keepalive-time", "30",
-                              "--retry", "4", "--retry-connrefused", "--retry-delay", "15", "--retry-max-time", "7200",
-                              "--upload-file", file_path, "--config", config_path,
-                              "--output", response_path, "--write-out", "\\n%{http_code}", upload_url,
-                          ]
-                          print(f"::notice title=BUZZHEAVIER Transport::Uploading '{remote_name}' to isolated directory (attempt {upload_attempt}/5). cURL retries interrupted connections.")
-                          process = subprocess.Popen(curl_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
-                          stderr_lines = []
-                          line_buffer = ""
-                          last_percent = [-5]
-
-                          def _buzz_progress_line(line):
-                              line = line.strip()
-                              if not line:
-                                  return
-                              stderr_lines.append(line)
-                              match = re.search(r"(?<!\d)(\d{1,3}(?:\.\d+)?)%", line)
-                              if match:
-                                  percent = max(0, min(100, int(float(match.group(1)))))
-                                  if percent >= last_percent[0] + 5 or percent == 100:
-                                      last_percent[0] = percent
-                                      update_progress("uploading", f"Uploading {file_name} to BUZZHEAVIER ({percent}% sent · {BUZZHEAVIER_REGION}).", file_name)
-
-                          while True:
-                              character = process.stderr.read(1)
-                              if character == "":
-                                  break
-                              if character in ("\r", "\n"):
-                                  _buzz_progress_line(line_buffer)
-                                  line_buffer = ""
-                              else:
-                                  line_buffer += character
-                          if line_buffer:
-                              _buzz_progress_line(line_buffer)
-                          stdout_text = process.stdout.read() if process.stdout else ""
-                          return_code = process.wait()
-                          output_lines = (stdout_text or "").strip().splitlines()
-                          try:
-                              http_status = int(output_lines[-1]) if output_lines else 0
-                          except (TypeError, ValueError):
-                              http_status = 0
-                          try:
-                              response_text = Path(response_path).read_text(encoding="utf-8", errors="replace")
-                          except OSError:
-                              response_text = ""
-                          return return_code, http_status, response_text, "\n".join(stderr_lines[-15:])[-1800:]
-                      finally:
-                          for path in (config_path, response_path):
-                              if path:
-                                  try:
-                                      os.remove(path)
-                                  except OSError:
-                                      pass
-
+                  import unicodedata
                   from urllib.parse import urlencode, urlparse
-                  buzz_completed = False
-                  last_buzz_error = None
-                  reserved_filename_chars = re.compile(r'[<>:"/\\\\|?*]')
-                  browser_headers = {
-                      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                      "Accept-Language": "en-US,en;q=0.9",
-                  }
 
-                  for buzz_attempt in range(1, 6):
-                      upload_directory_id, folder_name = _buzz_create_directory(buzz_attempt)
-                      # Some provider upload routes reject URL-reserved characters.
-                      # In that case a neutral temporary transfer name is uploaded,
-                      # then the File Manager rename API restores the exact original.
-                      use_temporary_name = bool(reserved_filename_chars.search(file_name))
-                      remote_upload_name = f"CLOBD-TRANSFER-{JOB_ID}-{RUN_ID or 'local'}-{buzz_attempt}.tmp" if use_temporary_name else file_name
-                      update_progress("uploading", f"Uploading {file_name} ({file_size_gb} GiB) into a fresh BUZZHEAVIER directory · {BUZZHEAVIER_REGION} · attempt {buzz_attempt}/5.", file_name)
-                      curl_code, curl_status, curl_body, curl_errors = _buzz_curl_upload(upload_directory_id, remote_upload_name, buzz_attempt)
+                  provider_upload_name = unicodedata.normalize("NFC", file_name)
+                  provider_upload_name = re.sub(r"[\x00-\x1f\x7f]", "", provider_upload_name)
+                  # Replace URL-path / filesystem-reserved characters with a hyphen
+                  # so the PUT URL route does not reject the upload with HTTP 400
+                  # "the Name field is invalid". Never append 1, 2 or any suffix.
+                  provider_upload_name = re.sub(r'[<>:"/\\|?*]', "-", provider_upload_name)
+                  provider_upload_name = re.sub(r"\s+", " ", provider_upload_name).strip(" .")
+                  provider_upload_name = re.sub(r"-{2,}", "-", provider_upload_name)
+                  if not provider_upload_name or provider_upload_name in (".", ".."):
+                      raise RuntimeError(f"{provider_label} filename became empty after removing unsupported URL-path characters.")
+                  if len(provider_upload_name) > 500:
+                      raise RuntimeError(f"{provider_label} filename exceeds the API's 500-character limit: {len(provider_upload_name)}")
 
-                      if curl_code != 0:
-                          last_buzz_error = f"cURL exit {curl_code}: {curl_errors or curl_body[:800]}"
-                          if buzz_attempt < 5:
-                              print(f"::warning title=BUZZHEAVIER Retry::{last_buzz_error}; creating a new directory and retrying the full file upload.")
-                              time.sleep(min(30, 5 * buzz_attempt))
-                              continue
-                          break
+                  provider_auth_headers = dict(HEADERS)
+                  provider_auth_headers["Authorization"] = f"Bearer {provider_account_id}"
 
-                      body_lower = curl_body.casefold()
-                      if curl_status == 400 and ("file already exists" in body_lower or "same name" in body_lower or "already exists with the same name" in body_lower):
-                          last_buzz_error = f"BUZZHEAVIER rejected a duplicate filename in isolated directory {folder_name}: {curl_body[:500]}"
-                          print(f"::warning title=BUZZHEAVIER Duplicate Retry::{last_buzz_error} Retrying in a newly created directory with the exact same filename; no suffix will be added.")
-                          if buzz_attempt < 5:
-                              time.sleep(3 * buzz_attempt)
-                              continue
-                          break
-                      if curl_status not in (200, 201):
-                          last_buzz_error = f"HTTP {curl_status}: {curl_body[:1000] or curl_errors}"
-                          if curl_status in (408, 425, 429, 500, 502, 503, 504) and buzz_attempt < 5:
-                              print(f"::warning title=BUZZHEAVIER Retry::{last_buzz_error}; retrying in a new directory.")
-                              time.sleep(min(45, 8 * buzz_attempt))
-                              continue
-                          # An invalid path filename is retried once using an
-                          # internal transfer name, then renamed to the exact
-                          # original through the documented File Manager API.
-                          if curl_status == 400 and not use_temporary_name and ("name" in body_lower and ("invalid" in body_lower or "field" in body_lower)):
-                              remote_upload_name = f"CLOBD-TRANSFER-{JOB_ID}-{RUN_ID or 'local'}-{buzz_attempt}.tmp"
-                              curl_code, curl_status, curl_body, curl_errors = _buzz_curl_upload(upload_directory_id, remote_upload_name, buzz_attempt)
-                              use_temporary_name = True
-                          if curl_status not in (200, 201):
-                              raise RuntimeError(f"Authenticated BUZZHEAVIER upload failed (HTTP {curl_status}): {curl_body[:1200] or curl_errors}")
-
-                      try:
-                          upload_payload = json.loads(curl_body)
-                      except ValueError as error:
-                          raise RuntimeError(f"BUZZHEAVIER returned invalid JSON (HTTP {curl_status}): {curl_body[:1000]}") from error
-                      upload_data = upload_payload.get("data") if isinstance(upload_payload, dict) and isinstance(upload_payload.get("data"), dict) else upload_payload
-                      buzz_file_id = str(upload_data.get("id") or upload_data.get("fileId") or upload_data.get("file_id") or "").strip() if isinstance(upload_data, dict) else ""
-                      if not buzz_file_id:
-                          last_buzz_error = f"BUZZHEAVIER returned HTTP {curl_status} but no file ID: {curl_body[:700]}"
-                          if buzz_attempt < 5:
-                              time.sleep(3 * buzz_attempt)
-                              continue
-                          break
-
-                      response_name = str(upload_data.get("name") or "").strip() if isinstance(upload_data, dict) else ""
-                      if response_name and response_name != remote_upload_name:
-                          raise RuntimeError(f"BUZZHEAVIER returned unexpected transfer filename '{response_name}' (expected '{remote_upload_name}').")
-                      response_size = upload_data.get("size") if isinstance(upload_data, dict) else None
-                      if response_size is not None and int(response_size) != file_size:
-                          raise RuntimeError(f"BUZZHEAVIER upload size mismatch: expected {file_size} bytes, received {response_size} bytes.")
-
-                      if use_temporary_name:
-                          rename_response = requests.patch(
-                              f"https://buzzheavier.com/api/fs/{quote(buzz_file_id, safe='')}",
-                              headers={**buzz_auth_headers, "Content-Type": "application/json"},
-                              json={"name": file_name},
-                              timeout=(20, 90),
-                          )
-                          if rename_response.status_code not in (200, 201, 204):
-                              raise RuntimeError(f"BUZZHEAVIER uploaded the transfer file but could not restore the exact original filename through File Manager rename (HTTP {rename_response.status_code}): {rename_response.text[:900]}. No link was saved.")
-
-                      # Verify only this job's directory (not the account-wide list).
-                      verified_file = None
-                      for verify_attempt in range(1, 6):
-                          verify_response = requests.get(
-                              f"https://buzzheavier.com/api/fs/{quote(upload_directory_id, safe='')}",
-                              headers=buzz_auth_headers,
-                              timeout=(20, 90),
-                          )
-                          if verify_response.status_code != 200:
-                              raise RuntimeError(f"BUZZHEAVIER isolated-directory verification failed (HTTP {verify_response.status_code}): {verify_response.text[:700]}")
-                          try:
-                              verify_payload = verify_response.json()
-                          except ValueError as error:
-                              raise RuntimeError("BUZZHEAVIER returned invalid JSON while verifying the uploaded file.") from error
-                          for found_name, found_id, found_item in _buzz_walk_files(verify_payload):
-                              if found_name == file_name:
-                                  candidate_size = None
-                                  for size_key in ("size", "fileSize", "file_size", "bytes"):
-                                      value = found_item.get(size_key) if isinstance(found_item, dict) else None
-                                      if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().isdigit()):
-                                          candidate_size = int(value)
-                                          break
-                                  if candidate_size is not None and candidate_size != file_size:
-                                      raise RuntimeError(f"BUZZHEAVIER stored file size mismatch: expected {file_size} bytes, received {candidate_size} bytes.")
-                                  verified_file = (found_id, found_item, candidate_size)
-                                  break
-                          if verified_file:
-                              break
-                          if verify_attempt < 5:
-                              update_progress("checking_account", f"BUZZHEAVIER accepted the upload; waiting for the exact filename to appear in its isolated directory ({verify_attempt}/5).", file_name)
-                              time.sleep(3)
-
-                      if not verified_file:
-                          last_buzz_error = f"BUZZHEAVIER accepted the upload but did not list the exact original filename '{file_name}' in directory {folder_name}."
-                          if buzz_attempt < 5:
-                              print(f"::warning title=BUZZHEAVIER Verification Retry::{last_buzz_error} Creating another isolated upload directory and retrying.")
-                              time.sleep(3 * buzz_attempt)
-                              continue
-                          break
-
-                      buzz_file_id = verified_file[0]
-                      if verified_file[2] is None and response_size is None:
-                          raise RuntimeError("BUZZHEAVIER File Manager did not expose a stored size, so the upload could not be fully verified. The link was not saved.")
-                      # The authenticated File Manager check above is the authoritative
-                      # upload verification: it confirms this exact file ID, filename,
-                      # and byte size inside this job's isolated directory. The public
-                      # landing page may return HTTP 403 to GitHub-hosted runners (edge
-                      # protection / automated-request filtering), even when the stored
-                      # file exists. Therefore a 403 is inconclusive, not an upload error.
-                      # Keep the canonical public file-page URL unchanged.
-                      result_url = f"https://buzzheavier.com/{quote(buzz_file_id, safe='')}"
-                      public_check_note = ""
-                      try:
-                          with requests.get(
-                              result_url,
-                              headers=browser_headers,
-                              stream=True,
-                              allow_redirects=True,
-                              timeout=(20, 60),
-                          ) as public_response:
-                              public_status = public_response.status_code
-                              if public_status in (200, 206):
-                                  final_public_url = urlparse(public_response.url)
-                                  if final_public_url.scheme != "https":
-                                      raise RuntimeError("BUZZHEAVIER public link redirected to a non-HTTPS URL; refusing to save it.")
-                                  public_preview = bytearray()
-                                  for chunk in public_response.iter_content(chunk_size=4096):
-                                      if chunk:
-                                          public_preview.extend(chunk[:4096])
-                                      if len(public_preview) >= 8192:
-                                          break
-                                  public_preview_text = bytes(public_preview).decode("utf-8", errors="ignore").casefold()
-                                  if any(marker in public_preview_text for marker in ("file not found", "this file was deleted", "file is unavailable", "file has expired", "404 not found")):
-                                      raise RuntimeError("BUZZHEAVIER public page reports that the uploaded file is unavailable; the URL was not saved.")
-                                  public_check_note = f"Public landing-page check returned HTTP {public_status}."
-                              elif public_status == 403:
-                                  public_check_note = "Public landing-page check returned HTTP 403 from the provider edge; treated as inconclusive because authenticated File Manager verification already confirmed the exact file ID, filename, and byte size."
-                                  print(f"::warning title=BUZZHEAVIER Public Check Inconclusive::{public_check_note} Saving the canonical file URL based on authenticated metadata verification.")
-                              elif public_status in (408, 425, 429, 500, 502, 503, 504):
-                                  public_check_note = f"Public landing-page check was temporarily unavailable (HTTP {public_status}); authenticated File Manager verification confirmed the stored file."
-                                  print(f"::warning title=BUZZHEAVIER Public Check Deferred::{public_check_note} Saving the canonical file URL based on authenticated metadata verification.")
-                              elif public_status in (404, 410):
-                                  raise RuntimeError(f"BUZZHEAVIER public page reports HTTP {public_status}; the file may not be publicly available. The URL was not saved.")
-                              else:
-                                  raise RuntimeError(f"BUZZHEAVIER public link check returned unexpected HTTP {public_status}; the URL was not saved.")
-                      except requests.RequestException as public_error:
-                          public_check_note = f"Public landing-page check could not be completed ({public_error}); authenticated File Manager verification confirmed the stored file."
-                          print(f"::warning title=BUZZHEAVIER Public Check Deferred::{public_check_note} Saving the canonical file URL based on authenticated metadata verification.")
-
-                      message = f"BUZZHEAVIER authenticated upload verified in {BUZZHEAVIER_REGION}: exact original filename and {file_size} bytes. Isolated directory {folder_name}; upload attempt {buzz_attempt}/5. {public_check_note}"
-                      buzz_completed = True
-                      print(f"::notice title=BUZZHEAVIER Upload Verified::File ID {buzz_file_id}; exact filename preserved: {file_name}.")
-                      break
-
-                  if not buzz_completed:
-                      raise RuntimeError(f"BUZZHEAVIER upload did not complete after 5 fresh-directory attempts: {last_buzz_error or 'unknown upload/verification error'}. No link was saved.")
-
-              else:
-                  # FUCKINGFAST authenticated account upload. Its Account ID is
-                  # read only from the encrypted GitHub Actions secret.
-                  # Authenticated account upload. The Account ID is injected only
-                  # from the encrypted GitHub Actions secret (never client_payload).
-                  allowed_regions = {
-                      "Asia-Pacific", "Western Europe", "Eastern Europe",
-                      "Central Europe", "Eastern US", "Western US",
-                  }
-                  if FUCKINGFAST_REGION not in allowed_regions:
-                      raise RuntimeError(f"Unsupported FUCKINGFAST storage region: {FUCKINGFAST_REGION}")
-                  if not FUCKINGFAST_ACCOUNT_ID:
-                      raise RuntimeError("FUCKINGFAST_ACCOUNT_ID GitHub Actions secret is missing.")
-
-                  # Keep the final File Manager filename exactly equal to the
-                  # original CLOBD filename. The upload route rejects some URL
-                  # reserved characters, so those files are transferred under a
-                  # temporary internal name and immediately renamed through the
-                  # documented File Manager API; the final name is never suffixed.
-                  fuckingfast_upload_name = file_name
-                  if not fuckingfast_upload_name or len(fuckingfast_upload_name) > 500:
-                      raise RuntimeError(f"FUCKINGFAST requires a non-empty filename of at most 500 characters; received {len(fuckingfast_upload_name)} characters.")
-                  fuckingfast_needs_rename = bool(re.search(r'[<>:"/\\|?*]', file_name))
-                  fuckingfast_remote_upload_name = (
-                      f"CLOBD-TRANSFER-{JOB_ID}-{RUN_ID or 'local'}-A{RUN_ATTEMPT}.tmp"
-                      if fuckingfast_needs_rename else file_name
-                  )
-                  if fuckingfast_needs_rename:
-                      print(f"::notice title=FUCKINGFAST Exact Filename::Using an internal transfer name only during upload; the File Manager will rename it to the exact original filename: {file_name}")
-
-                  fuckingfast_auth_headers = dict(HEADERS)
-                  fuckingfast_auth_headers["Authorization"] = f"Bearer {FUCKINGFAST_ACCOUNT_ID}"
-
-                  # Get the authenticated root directory. API docs specify that
-                  # account uploads must target a parent directory ID.
-                  update_progress("checking_account", "Authenticating with FUCKINGFAST and resolving the account root directory.", file_name)
+                  update_progress("checking_account", f"Authenticating with {provider_label} and resolving the account root directory.", file_name)
                   root_response = requests.get(
-                      "https://fuckingfast.net/api/fs",
-                      headers=fuckingfast_auth_headers,
+                      f"https://{provider_domain}/api/fs",
+                      headers=provider_auth_headers,
                       timeout=(20, 90),
                   )
                   if root_response.status_code != 200:
-                      raise RuntimeError(f"FUCKINGFAST File Manager authentication/root lookup failed (HTTP {root_response.status_code}): {root_response.text[:700]}")
+                      raise RuntimeError(f"{provider_label} File Manager authentication/root lookup failed (HTTP {root_response.status_code}): {root_response.text[:700]}")
                   try:
                       root_payload = root_response.json()
                   except ValueError as error:
-                      raise RuntimeError("FUCKINGFAST File Manager returned invalid JSON for the root directory.") from error
+                      raise RuntimeError(f"{provider_label} File Manager returned invalid JSON for the root directory.") from error
                   if not isinstance(root_payload, dict):
-                      raise RuntimeError("FUCKINGFAST File Manager returned an unexpected root-directory response.")
+                      raise RuntimeError(f"{provider_label} File Manager returned an unexpected root-directory response.")
 
-                  def _is_scalar_id(value):
+                  def _scalar_id(value):
                       return isinstance(value, (str, int)) and str(value).strip() != ""
-
-                  def _find_root_directory_id(payload):
-                      # Prefer explicit root/parent identifiers wherever the API
-                      # nests its root metadata, then use the id of the root node.
-                      preferred = ("rootId", "rootDirectoryId", "directoryId", "parentId", "folderId", "root_id", "parent_id")
-                      containers = []
-                      def collect_containers(value, depth=0):
-                          if depth > 8:
-                              return
-                          if isinstance(value, dict):
-                              containers.append(value)
-                              for child in value.values():
-                                  if isinstance(child, (dict, list)):
-                                      collect_containers(child, depth + 1)
-                          elif isinstance(value, list):
-                              for child in value:
-                                  if isinstance(child, (dict, list)):
-                                      collect_containers(child, depth + 1)
-                      collect_containers(payload)
-                      for container in containers:
-                          for key in preferred:
-                              value = container.get(key)
-                              if _is_scalar_id(value):
-                                  return str(value).strip()
-                      # Root nodes generally expose their own id plus contents;
-                      # also accept explicit root/current-directory wrappers.
-                      for container in containers:
-                          has_contents = any(k in container for k in ("files", "folders", "directories", "items", "children", "contents"))
-                          is_root_wrapper = any(k in container for k in ("root", "rootDirectory", "currentDirectory", "directory"))
-                          if has_contents or is_root_wrapper:
-                              for key in ("id", "_id"):
-                                  value = container.get(key)
-                                  if _is_scalar_id(value):
-                                      return str(value).strip()
-                      return ""
-
-                  root_directory_id = _find_root_directory_id(root_payload)
-                  if not root_directory_id:
-                      top_keys = ", ".join(str(k) for k in list(root_payload.keys())[:20])
-                      raise RuntimeError("FUCKINGFAST authenticated root response did not expose a root directory ID; upload stopped safely. Root response keys: " + (top_keys or "none"))
-
-                  # Do not search the account File Manager for a matching filename.
-                  # Each GitHub queue run gets its own private directory so an
-                  # older root-level file (or another post with a normalized
-                  # filename collision) cannot block this upload. The stable
-                  # provider-safe name is used inside the folder with no suffix.
-                  folder_name = f"CLOBD-P{POST_ID}-J{JOB_ID}-R{RUN_ID or 'local'}-A{RUN_ATTEMPT}"
-                  root_id_encoded = quote(root_directory_id, safe="")
-                  folder_create_response = requests.post(
-                      f"https://fuckingfast.net/api/fs/{root_id_encoded}",
-                      headers={**fuckingfast_auth_headers, "Content-Type": "application/json"},
-                      json={"name": folder_name},
-                      timeout=(20, 90),
-                  )
-                  if folder_create_response.status_code not in (200, 201):
-                      raise RuntimeError(
-                          "FUCKINGFAST could not create this job's isolated upload directory "
-                          f"(HTTP {folder_create_response.status_code}): {folder_create_response.text[:900]}"
-                      )
-                  try:
-                      folder_create_payload = folder_create_response.json()
-                  except ValueError as error:
-                      raise RuntimeError("FUCKINGFAST returned invalid JSON after creating the isolated upload directory.") from error
-                  if not isinstance(folder_create_payload, dict):
-                      raise RuntimeError("FUCKINGFAST returned an unexpected upload-directory response.")
 
                   def _walk_json_dicts(value, depth=0):
                       if depth > 10:
@@ -1493,48 +953,28 @@ jobs:
                               if isinstance(child, (dict, list)):
                                   yield from _walk_json_dicts(child, depth + 1)
 
-                  def _scalar_id(value):
-                      return isinstance(value, (str, int)) and str(value).strip() != ""
+                  def _find_root_directory_id(payload):
+                      preferred = ("rootId", "rootDirectoryId", "directoryId", "parentId", "folderId", "root_id", "parent_id")
+                      containers = list(_walk_json_dicts(payload))
+                      for container in containers:
+                          for key in preferred:
+                              value = container.get(key)
+                              if _scalar_id(value):
+                                  return str(value).strip()
+                      for container in containers:
+                          has_contents = any(k in container for k in ("files", "folders", "directories", "items", "children", "contents"))
+                          is_root_wrapper = any(k in container for k in ("root", "rootDirectory", "currentDirectory", "directory"))
+                          if has_contents or is_root_wrapper:
+                              for key in ("id", "_id"):
+                                  value = container.get(key)
+                                  if _scalar_id(value):
+                                      return str(value).strip()
+                      return ""
 
-                  upload_directory_id = ""
-                  folder_response_dicts = list(_walk_json_dicts(folder_create_payload))
-                  # Prefer an object explicitly named as the folder we just created.
-                  for item in folder_response_dicts:
-                      if str(item.get("name", "")).strip() == folder_name:
-                          for key in ("id", "directoryId", "folderId", "folder_id", "_id"):
-                              if _scalar_id(item.get(key)):
-                                  upload_directory_id = str(item[key]).strip()
-                                  break
-                      if upload_directory_id:
-                          break
-                  # Some API responses return only {"id": "..."} (or wrap it
-                  # in data/result), so accept an ID from the creation response.
-                  if not upload_directory_id:
-                      preferred_containers = [folder_create_payload]
-                      for key in ("data", "result", "directory", "folder"):
-                          value = folder_create_payload.get(key)
-                          if isinstance(value, dict):
-                              preferred_containers.insert(0, value)
-                      for item in preferred_containers:
-                          for key in ("id", "directoryId", "folderId", "folder_id", "_id"):
-                              if _scalar_id(item.get(key)):
-                                  candidate = str(item[key]).strip()
-                                  if candidate != root_directory_id:
-                                      upload_directory_id = candidate
-                                      break
-                          if upload_directory_id:
-                              break
-                  if not upload_directory_id or upload_directory_id == root_directory_id:
-                      raise RuntimeError(
-                          "FUCKINGFAST created the upload directory but did not return its directory ID. "
-                          "Upload stopped safely; no alternate filename was generated. Response: "
-                          + json.dumps(folder_create_payload, ensure_ascii=False)[:900]
-                      )
-
-                  print(
-                      f"::notice title=FUCKINGFAST Isolated Directory::Created {folder_name}; "
-                      "no account-wide filename duplicate scan was performed."
-                  )
+                  root_directory_id = _find_root_directory_id(root_payload)
+                  if not root_directory_id:
+                      top_keys = ", ".join(str(k) for k in list(root_payload.keys())[:20])
+                      raise RuntimeError(f"{provider_label} authenticated root response did not expose a root directory ID; upload stopped safely. Root response keys: " + (top_keys or "none"))
 
                   def _walk_named_items(value, depth=0):
                       if depth > 10:
@@ -1553,12 +993,110 @@ jobs:
                           for item in value:
                               yield from _walk_named_items(item, depth + 1)
 
-                  # Resolve the selected storage location. The upload goes directly
-                  # into the unique directory created for this queue run; no move or
-                  # account-wide filename scan is needed.
-                  update_progress("uploading", f"Resolving FUCKINGFAST {FUCKINGFAST_REGION} storage location.", file_name)
+                  def _walk_named_directories(value, depth=0):
+                      if depth > 10:
+                          return
+                      if isinstance(value, dict):
+                          name = value.get("name") or value.get("filename")
+                          item_id = value.get("id") or value.get("directoryId") or value.get("folderId") or value.get("folder_id") or value.get("_id")
+                          item_type = str(value.get("type") or value.get("kind") or "").strip().casefold()
+                          is_directory = (value.get("isDirectory") is True) or (value.get("is_dir") is True) or item_type in ("directory", "folder", "dir")
+                          if isinstance(name, str) and _scalar_id(item_id) and is_directory:
+                              yield name, str(item_id).strip(), value
+                          for key in ("data", "files", "folders", "directories", "items", "children", "contents", "result"):
+                              if key in value:
+                                  yield from _walk_named_directories(value[key], depth + 1)
+                      elif isinstance(value, list):
+                          for item in value:
+                              yield from _walk_named_directories(item, depth + 1)
+
+                  def _create_isolated_upload_directory(attempt_num):
+                      folder_name = f"CLOBD-P{POST_ID}-J{JOB_ID}-R{RUN_ID or 'local'}-A{RUN_ATTEMPT}-T{attempt_num}-{int(time.time() * 1000)}"
+                      root_id_encoded = quote(root_directory_id, safe="")
+                      folder_create_response = requests.post(
+                          f"https://{provider_domain}/api/fs/{root_id_encoded}",
+                          headers={**provider_auth_headers, "Content-Type": "application/json"},
+                          json={"name": folder_name},
+                          timeout=(20, 90),
+                      )
+                      if folder_create_response.status_code not in (200, 201):
+                          raise RuntimeError(
+                              f"{provider_label} could not create this job's isolated upload directory "
+                              f"(HTTP {folder_create_response.status_code}): {folder_create_response.text[:900]}"
+                          )
+                      try:
+                          folder_create_payload = folder_create_response.json()
+                      except ValueError:
+                          folder_create_payload = {}
+
+                      created_dir_id = ""
+                      if isinstance(folder_create_payload, dict):
+                          for item in _walk_json_dicts(folder_create_payload):
+                              if str(item.get("name", "")).strip() == folder_name:
+                                  for key in ("id", "directoryId", "folderId", "folder_id", "_id"):
+                                      if _scalar_id(item.get(key)):
+                                          created_dir_id = str(item[key]).strip()
+                                          break
+                              if created_dir_id:
+                                  break
+                          if not created_dir_id:
+                              preferred_containers = [folder_create_payload]
+                              for key in ("data", "result", "directory", "folder"):
+                                  value = folder_create_payload.get(key)
+                                  if isinstance(value, dict):
+                                      preferred_containers.insert(0, value)
+                              for item in preferred_containers:
+                                  for key in ("id", "directoryId", "folderId", "folder_id", "_id"):
+                                      if _scalar_id(item.get(key)):
+                                          candidate = str(item[key]).strip()
+                                          if candidate != root_directory_id:
+                                              created_dir_id = candidate
+                                              break
+                                  if created_dir_id:
+                                      break
+
+                      # Fallback: if POST /api/fs/{rootId} returned HTTP 200/201 without
+                      # embedding the new directory ID in the response body, look up
+                      # folder_name inside the authenticated root directory listing.
+                      if not created_dir_id or created_dir_id == root_directory_id:
+                          lookup_resp = requests.get(
+                              f"https://{provider_domain}/api/fs",
+                              headers=provider_auth_headers,
+                              timeout=(20, 90),
+                          )
+                          if lookup_resp.status_code == 200:
+                              try:
+                                  lookup_payload = lookup_resp.json()
+                              except ValueError:
+                                  lookup_payload = {}
+                              for d_name, d_id, _d_item in _walk_named_directories(lookup_payload):
+                                  if d_name == folder_name and d_id != root_directory_id:
+                                      created_dir_id = d_id
+                                      break
+                              if not created_dir_id:
+                                  for item in _walk_json_dicts(lookup_payload):
+                                      if str(item.get("name", "")).strip() == folder_name:
+                                          for key in ("id", "directoryId", "folderId", "folder_id", "_id"):
+                                              if _scalar_id(item.get(key)) and str(item[key]).strip() != root_directory_id:
+                                                  created_dir_id = str(item[key]).strip()
+                                                  break
+                                      if created_dir_id:
+                                          break
+
+                      if not created_dir_id or created_dir_id == root_directory_id:
+                          raise RuntimeError(
+                              f"{provider_label} created the upload directory '{folder_name}' but did not expose its directory ID."
+                          )
+                      print(
+                          f"::notice title={provider_label} Isolated Directory::Created {folder_name} ({created_dir_id}); "
+                          "no duplicate check was performed."
+                      )
+                      return created_dir_id, folder_name
+
+                  # Resolve the selected storage location ID.
+                  update_progress("uploading", f"Resolving {provider_label} {provider_region} storage location.", file_name)
                   locations_response = requests.get(
-                      "https://fuckingfast.net/api/locations",
+                      f"https://{provider_domain}/api/locations",
                       headers=HEADERS,
                       timeout=(20, 60),
                   )
@@ -1566,518 +1104,328 @@ jobs:
                   try:
                       locations_data = locations_response.json()
                   except ValueError as error:
-                      raise RuntimeError("FUCKINGFAST locations API returned invalid JSON.") from error
+                      raise RuntimeError(f"{provider_label} locations API returned invalid JSON.") from error
                   location_rows = locations_data.get("data") if isinstance(locations_data, dict) else None
                   if not isinstance(location_rows, list):
-                      raise RuntimeError("FUCKINGFAST locations API did not return a valid data array.")
+                      raise RuntimeError(f"{provider_label} locations API did not return a valid data array.")
                   location_id = ""
                   for location in location_rows:
-                      if isinstance(location, dict) and str(location.get("name", "")).strip().casefold() == FUCKINGFAST_REGION.casefold():
+                      if isinstance(location, dict) and str(location.get("name", "")).strip().casefold() == provider_region.casefold():
                           location_id = str(location.get("id", "")).strip()
                           break
                   if not location_id:
                       available = ", ".join(str(x.get("name", "")) for x in location_rows if isinstance(x, dict))
-                      raise RuntimeError(f"FUCKINGFAST region '{FUCKINGFAST_REGION}' was not returned by the locations API. Available: {available or 'none'}")
+                      raise RuntimeError(f"{provider_label} region '{provider_region}' was not returned by the locations API. Available: {available or 'none'}")
 
-                  from urllib.parse import urlencode
-                  encoded_name = quote(fuckingfast_remote_upload_name, safe="")
-                  encoded_upload_directory_id = quote(upload_directory_id, safe="")
+                  expected_file_size = int(os.path.getsize(file_path))
+                  encoded_name = quote(provider_upload_name, safe="")
                   query = urlencode({"locationId": location_id})
-                  # Upload directly into this job's isolated account directory.
-                  # The documented /{parentId}/{name} route avoids a second File
-                  # Manager move request, which previously returned HTTP 405.
-                  # Keep the selected storage location in the query string.
-                  upload_url = f"https://w.fuckingfast.net/{encoded_upload_directory_id}/{encoded_name}?{query}"
-                  upload_label = file_name
-                  update_progress("uploading", f"Uploading {upload_label} ({file_size_gb} GiB) into your FUCKINGFAST account · {FUCKINGFAST_REGION}.", file_name)
 
-                  # Use FUCKINGFAST's documented cURL -T upload method rather
-                  # than requests.put() with a custom streaming iterator. This
-                  # avoids the requests/urllib3 TLS EOF failure seen on large
-                  # uploads and lets curl retry a dropped upload connection.
-                  update_progress("uploading", f"Uploading {file_name} ({file_size_gb} GiB) into your FUCKINGFAST account · {FUCKINGFAST_REGION}.", file_name)
+                  verified_file_id = ""
+                  verified_returned_url = ""
+                  final_remote_name = provider_upload_name
+                  last_upload_error = None
 
-                  curl_config_path = ""
-                  curl_response_path = ""
-                  try:
-                      # Keep the Account ID out of the curl process arguments.
-                      config_fd, curl_config_path = tempfile.mkstemp(prefix="clobd-fuckingfast-", suffix=".curl")
-                      os.chmod(curl_config_path, 0o600)
-                      safe_account_id = FUCKINGFAST_ACCOUNT_ID.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
-                      with os.fdopen(config_fd, "w", encoding="utf-8") as config_file:
-                          config_file.write(f'header = "Authorization: Bearer {safe_account_id}"\n')
-                          config_file.write('header = "Content-Type: application/octet-stream"\n')
-
-                      response_fd, curl_response_path = tempfile.mkstemp(prefix="clobd-fuckingfast-response-", suffix=".json")
-                      os.close(response_fd)
-
-                      curl_command = [
-                          "curl",
-                          "--http1.1",
-                          "--show-error",
-                          "--progress-bar",
-                          "--connect-timeout", "60",
-                          "--max-time", "0",
-                          "--keepalive-time", "30",
-                          "--retry", "4",
-                          "--retry-connrefused",
-                          "--retry-delay", "15",
-                          "--retry-max-time", "14400",
-                          "--upload-file", file_path,
-                          "--config", curl_config_path,
-                          "--output", curl_response_path,
-                          "--write-out", "\n%{http_code}",
-                          upload_url,
-                      ]
-
-                      print("::notice title=FUCKINGFAST Transport::Uploading the original filename into this job’s isolated authenticated directory. cURL retries transient connection/server errors, not permanent HTTP 400 filename conflicts.")
-                      curl_process = subprocess.Popen(
-                          curl_command,
-                          stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE,
-                          text=True,
-                          encoding="utf-8",
-                          errors="replace",
-                          bufsize=1,
-                      )
-
-                      curl_stderr_lines = []
-                      curl_line_buffer = ""
-                      last_curl_percent = [-5]
-
-                      def _handle_curl_progress_line(line):
-                          line = line.strip()
-                          if not line:
-                              return
-                          curl_stderr_lines.append(line)
-                          lowered = line.casefold()
-                          if "will retry" in lowered or "retrying" in lowered:
-                              update_progress(
-                                  "uploading",
-                                  f"FUCKINGFAST connection was interrupted. cURL is retrying the upload from the beginning of the file ({FUCKINGFAST_REGION}).",
-                                  file_name,
-                              )
-                          match = re.search(r"(?<!\d)(\d{1,3}(?:\.\d+)?)%", line)
-                          if match:
-                              percent = max(0, min(100, int(float(match.group(1)))))
-                              if percent >= last_curl_percent[0] + 5 or percent == 100:
-                                  last_curl_percent[0] = percent
-                                  update_progress(
-                                      "uploading",
-                                      f"Uploading {file_name} into FUCKINGFAST account ({percent}% sent · {FUCKINGFAST_REGION}).",
-                                      file_name,
-                                  )
-
-                      # Read cURL's carriage-return progress meter live so the
-                      # WordPress Cloud Monitor continues receiving progress.
-                      while True:
-                          character = curl_process.stderr.read(1)
-                          if character == "":
-                              break
-                          if character in ("\r", "\n"):
-                              _handle_curl_progress_line(curl_line_buffer)
-                              curl_line_buffer = ""
-                          else:
-                              curl_line_buffer += character
-                      if curl_line_buffer:
-                          _handle_curl_progress_line(curl_line_buffer)
-
-                      curl_stdout = curl_process.stdout.read() if curl_process.stdout else ""
-                      curl_return_code = curl_process.wait()
-                      curl_http_text = (curl_stdout or "").strip().splitlines()
+                  for upload_attempt in range(1, 4):
+                      curl_config_path = ""
+                      curl_response_path = ""
+                      upload_directory_id = ""
                       try:
-                          curl_http_status = int(curl_http_text[-1]) if curl_http_text else 0
-                      except (TypeError, ValueError):
-                          curl_http_status = 0
+                          upload_directory_id, folder_name = _create_isolated_upload_directory(upload_attempt)
+                          encoded_upload_directory_id = quote(upload_directory_id, safe="")
+                          upload_url = f"https://w.{provider_domain}/{encoded_upload_directory_id}/{encoded_name}?{query}"
 
-                      try:
-                          with open(curl_response_path, "r", encoding="utf-8", errors="replace") as response_file:
-                              curl_response_text = response_file.read()
-                      except OSError:
-                          curl_response_text = ""
+                          attempt_label = f" (attempt {upload_attempt}/3)" if upload_attempt > 1 else ""
+                          update_progress(
+                              "uploading",
+                              f"Uploading {file_name} ({file_size_gb} GiB) into your {provider_label} account · {provider_region}{attempt_label}.",
+                              file_name,
+                          )
 
-                      if curl_return_code != 0:
-                          useful_curl_errors = [
-                              line for line in curl_stderr_lines
-                              if any(token in line.casefold() for token in ("curl:", "error", "retry", "failed", "ssl", "timed out"))
+                          config_fd, curl_config_path = tempfile.mkstemp(prefix=f"clobd-{PLATFORM}-", suffix=".curl")
+                          os.chmod(curl_config_path, 0o600)
+                          safe_account_id = provider_account_id.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
+                          with os.fdopen(config_fd, "w", encoding="utf-8") as config_file:
+                              config_file.write(f'header = "Authorization: Bearer {safe_account_id}"\n')
+                              config_file.write('header = "Content-Type: application/octet-stream"\n')
+
+                          response_fd, curl_response_path = tempfile.mkstemp(prefix=f"clobd-{PLATFORM}-response-", suffix=".json")
+                          os.close(response_fd)
+
+                          # Each upload attempt uses its own freshly-created isolated directory.
+                          # Do not use --retry-all-errors inside the same directory, because if a
+                          # connection drops after the server already created the file, retrying
+                          # into the same directory would trigger HTTP 400 "file already exists".
+                          # Instead, Python retries in a new isolated directory on any failure.
+                          curl_command = [
+                              "curl",
+                              "--http1.1",
+                              "--show-error",
+                              "--progress-bar",
+                              "--connect-timeout", "60",
+                              "--max-time", "0",
+                              "--keepalive-time", "30",
+                              "--retry", "2",
+                              "--retry-connrefused",
+                              "--retry-delay", "10",
+                              "--upload-file", file_path,
+                              "--config", curl_config_path,
+                              "--output", curl_response_path,
+                              "--write-out", "\n%{http_code}",
+                              upload_url,
                           ]
-                          curl_error_detail = "\n".join(useful_curl_errors[-12:])[-1600:]
-                          if not curl_error_detail:
-                              curl_error_detail = f"cURL exited with code {curl_return_code} without additional diagnostics."
-                          raise RuntimeError(
-                              "FUCKINGFAST upload transport failed after automatic retries "
-                              f"(cURL exit {curl_return_code}). {curl_error_detail}"
+
+                          print(f"::notice title={provider_label} Transport::Uploading into isolated directory {folder_name}{attempt_label}.")
+                          curl_process = subprocess.Popen(
+                              curl_command,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE,
+                              text=True,
+                              encoding="utf-8",
+                              errors="replace",
+                              bufsize=1,
                           )
 
-                      if curl_http_status not in (200, 201):
-                          initial_error_text = curl_response_text[:1200] or "No response body"
-                          initial_error_lower = initial_error_text.casefold()
-                          duplicate_conflict = curl_http_status in (400, 409) and any(
-                              marker in initial_error_lower
-                              for marker in ("file already exists", "already exists with the same name", "same name", "duplicate filename")
-                          )
-                          if not duplicate_conflict:
-                              raise RuntimeError(
-                                  f"Authenticated FUCKINGFAST account upload failed (HTTP {curl_http_status}): "
-                                  f"{initial_error_text}"
-                              )
+                          curl_stderr_lines = []
+                          curl_line_buffer = ""
+                          last_curl_percent = [-5]
 
-                          # A duplicate is never accepted as a successful upload.
-                          # Create a fresh directory and retry the exact original
-                          # filename; never append a number or reuse an old URL.
-                          duplicate_retry_succeeded = False
-                          last_duplicate_error = initial_error_text
-                          for duplicate_retry in range(1, 6):
-                              retry_folder_name = (
-                                  f"CLOBD-P{POST_ID}-J{JOB_ID}-R{RUN_ID or 'local'}-A{RUN_ATTEMPT}-D{duplicate_retry}"
-                              )
-                              retry_folder_response = requests.post(
-                                  f"https://fuckingfast.net/api/fs/{quote(root_directory_id, safe='')}",
-                                  headers={**fuckingfast_auth_headers, "Content-Type": "application/json"},
-                                  json={"name": retry_folder_name},
+                          def _handle_curl_progress_line(line):
+                              line = line.strip()
+                              if not line:
+                                  return
+                              curl_stderr_lines.append(line)
+                              match = re.search(r"(?<!\d)(\d{1,3}(?:\.\d+)?)%", line)
+                              if match:
+                                  percent = max(0, min(100, int(float(match.group(1)))))
+                                  if percent >= last_curl_percent[0] + 5 or percent == 100:
+                                      last_curl_percent[0] = percent
+                                      update_progress(
+                                          "uploading",
+                                          f"Uploading {file_name} into {provider_label} account ({percent}% sent · {provider_region}{attempt_label}).",
+                                          file_name,
+                                      )
+
+                          while True:
+                              character = curl_process.stderr.read(1)
+                              if character == "":
+                                  break
+                              if character in ("\r", "\n"):
+                                  _handle_curl_progress_line(curl_line_buffer)
+                                  curl_line_buffer = ""
+                              else:
+                                  curl_line_buffer += character
+                          if curl_line_buffer:
+                              _handle_curl_progress_line(curl_line_buffer)
+
+                          curl_stdout = curl_process.stdout.read() if curl_process.stdout else ""
+                          curl_return_code = curl_process.wait()
+                          curl_http_text = (curl_stdout or "").strip().splitlines()
+                          try:
+                              curl_http_status = int(curl_http_text[-1]) if curl_http_text else 0
+                          except (TypeError, ValueError):
+                              curl_http_status = 0
+
+                          try:
+                              with open(curl_response_path, "r", encoding="utf-8", errors="replace") as response_file:
+                                  curl_response_text = response_file.read()
+                          except OSError:
+                              curl_response_text = ""
+
+                          try:
+                              upload_data = json.loads(curl_response_text) if curl_response_text.strip() else {}
+                          except ValueError:
+                              upload_data = {"raw": curl_response_text.strip()}
+
+                          response_code = upload_data.get("code") if isinstance(upload_data, dict) else None
+                          response_data = upload_data.get("data") if isinstance(upload_data, dict) and isinstance(upload_data.get("data"), dict) else upload_data
+                          candidate_file_id = ""
+                          if isinstance(response_data, dict):
+                              for id_key in ("id", "fileId", "file_id", "hash"):
+                                  cid = response_data.get(id_key)
+                                  if isinstance(cid, (str, int)) and str(cid).strip():
+                                      candidate_file_id = str(cid).strip()
+                                      break
+                          candidate_returned_url = ""
+                          if isinstance(response_data, dict):
+                              for url_key in ("url", "downloadUrl", "download_url", "downloadPage", "downloadPageUrl", "shareUrl", "share_url", "link"):
+                                  curl_u = response_data.get(url_key)
+                                  if isinstance(curl_u, str) and curl_u.strip().startswith("https://"):
+                                      candidate_returned_url = curl_u.strip()
+                                      break
+
+                          raw_value = str(upload_data.get("raw", "")).strip() if isinstance(upload_data, dict) else ""
+                          if not candidate_returned_url and raw_value:
+                              if raw_value.startswith("https://"):
+                                  candidate_returned_url = raw_value
+                              elif len(raw_value) <= 500 and " " not in raw_value:
+                                  candidate_file_id = raw_value
+
+                          # Check the isolated directory in the File Manager to verify whether
+                          # the file was stored with the exact expected byte size (even if cURL
+                          # saw a late connection drop after the server finished storing the file).
+                          account_file_id = ""
+                          account_file_item = None
+                          verify_directory_url = f"https://{provider_domain}/api/fs/{quote(upload_directory_id, safe='')}"
+                          if curl_return_code == 0 and curl_http_status in (200, 201):
+                              verify_passes = 4
+                          else:
+                              verify_passes = 2
+
+                          for verify_attempt in range(1, verify_passes + 1):
+                              verify_directory_response = requests.get(
+                                  verify_directory_url,
+                                  headers=provider_auth_headers,
                                   timeout=(20, 90),
                               )
-                              if retry_folder_response.status_code not in (200, 201):
-                                  raise RuntimeError(
-                                      "FUCKINGFAST reported a duplicate filename and could not create a fresh retry directory "
-                                      f"(HTTP {retry_folder_response.status_code}): {retry_folder_response.text[:900]}"
-                                  )
-                              try:
-                                  retry_folder_payload = retry_folder_response.json()
-                              except ValueError as error:
-                                  raise RuntimeError("FUCKINGFAST returned invalid JSON while creating a duplicate-retry directory.") from error
-                              retry_folder_id = ""
-                              for retry_item in _walk_json_dicts(retry_folder_payload):
-                                  if str(retry_item.get("name", "")).strip() == retry_folder_name:
-                                      for retry_key in ("id", "directoryId", "folderId", "folder_id", "_id"):
-                                          if _scalar_id(retry_item.get(retry_key)):
-                                              retry_folder_id = str(retry_item[retry_key]).strip()
-                                              break
-                                  if retry_folder_id:
+                              if verify_directory_response.status_code == 200:
+                                  try:
+                                      verify_directory_payload = verify_directory_response.json()
+                                  except ValueError:
+                                      verify_directory_payload = {}
+                                  for found_name, found_id, found_item in _walk_named_items(verify_directory_payload):
+                                      if found_name not in (provider_upload_name, file_name):
+                                          continue
+                                      candidate_size = None
+                                      if isinstance(found_item, dict):
+                                          for size_key in ("size", "fileSize", "file_size", "bytes"):
+                                              value = found_item.get(size_key)
+                                              if isinstance(value, (int, float)):
+                                                  candidate_size = int(value)
+                                                  break
+                                              if isinstance(value, str) and value.strip().isdigit():
+                                                  candidate_size = int(value.strip())
+                                                  break
+                                      if candidate_size is not None and candidate_size != expected_file_size:
+                                          continue
+                                      account_file_id = found_id
+                                      account_file_item = found_item
+                                      final_remote_name = found_name
                                       break
-                              if not retry_folder_id:
-                                  retry_container = retry_folder_payload.get("data") if isinstance(retry_folder_payload, dict) else None
-                                  if isinstance(retry_container, dict):
-                                      for retry_key in ("id", "directoryId", "folderId", "folder_id", "_id"):
-                                          if _scalar_id(retry_container.get(retry_key)):
-                                              retry_folder_id = str(retry_container[retry_key]).strip()
-                                              break
-                              if not retry_folder_id or retry_folder_id == root_directory_id:
+                              if account_file_id:
+                                  break
+                              if verify_attempt < verify_passes:
+                                  time.sleep(3)
+
+                          if not account_file_id:
+                              if curl_return_code != 0:
+                                  useful_curl_errors = [
+                                      line for line in curl_stderr_lines
+                                      if any(token in line.casefold() for token in ("curl:", "error", "retry", "failed", "ssl", "timed out"))
+                                  ]
+                                  curl_error_detail = "\n".join(useful_curl_errors[-12:])[-1600:]
                                   raise RuntimeError(
-                                      "FUCKINGFAST created a retry directory but did not return its ID. "
-                                      "Upload stopped without changing the original filename."
+                                      f"{provider_label} upload transport failed (cURL exit {curl_return_code}). "
+                                      f"{curl_error_detail or 'No additional cURL diagnostics.'}"
+                                  )
+                              if curl_http_status not in (200, 201):
+                                  raise RuntimeError(
+                                      f"Authenticated {provider_label} account upload failed (HTTP {curl_http_status}): "
+                                      f"{curl_response_text[:1200] or 'No response body'}"
+                                  )
+                              if isinstance(upload_data, dict):
+                                  api_status = str(upload_data.get("status", "")).strip().casefold()
+                                  if upload_data.get("success") is False or api_status in ("error", "failed", "failure"):
+                                      raise RuntimeError(f"{provider_label} API reported an unsuccessful upload: {curl_response_text[:1200]}")
+                                  if response_code is not None and str(response_code) not in ("200", "201"):
+                                      raise RuntimeError(f"{provider_label} account upload returned an unsuccessful API code ({response_code}): {curl_response_text[:1200]}")
+
+                              # If BUZZHEAVIER/FUCKINGFAST returned a valid file ID directly in the
+                              # HTTP 200/201 upload response with matching size, accept it.
+                              if candidate_file_id:
+                                  returned_size = response_data.get("size") if isinstance(response_data, dict) else None
+                                  if returned_size is not None:
+                                      try:
+                                          if int(returned_size) != expected_file_size:
+                                              raise RuntimeError(
+                                                  f"{provider_label} returned a file size that does not match the uploaded source: "
+                                                  f"expected {expected_file_size} bytes, received {returned_size} bytes."
+                                              )
+                                      except (TypeError, ValueError):
+                                          pass
+                                  account_file_id = candidate_file_id
+                              else:
+                                  raise RuntimeError(
+                                      f"{provider_label} accepted the upload request, but the uploaded file could not be "
+                                      "verified in the isolated directory and no file ID was returned."
                                   )
 
-                              upload_directory_id = retry_folder_id
-                              folder_name = retry_folder_name
-                              verify_directory_url = f"https://fuckingfast.net/api/fs/{quote(upload_directory_id, safe='')}"
-                              retry_upload_url = (
-                                  f"https://w.fuckingfast.net/{quote(upload_directory_id, safe='')}/"
-                                  f"{quote(fuckingfast_remote_upload_name, safe='')}?{query}"
-                              )
-                              curl_command[-1] = retry_upload_url
+                          if isinstance(account_file_item, dict) and not candidate_returned_url:
+                              for item_url_key in ("url", "downloadUrl", "download_url", "downloadPage", "downloadPageUrl", "shareUrl", "share_url", "link"):
+                                  candidate_item_url = account_file_item.get(item_url_key)
+                                  if isinstance(candidate_item_url, str) and candidate_item_url.strip().startswith("https://"):
+                                      candidate_returned_url = candidate_item_url.strip()
+                                      break
+
+                          # Attempt to set the exact original filename via File Manager PATCH
+                          # if any URL-path characters (such as '|') were normalized during PUT.
+                          if file_name != provider_upload_name and account_file_id:
+                              visual_pipe_name = file_name.replace("|", "∣")
+                              for candidate_exact_name in (file_name, visual_pipe_name):
+                                  if not candidate_exact_name or candidate_exact_name == final_remote_name:
+                                      continue
+                                  try:
+                                      rename_resp = requests.patch(
+                                          f"https://{provider_domain}/api/fs/{quote(account_file_id, safe='')}",
+                                          headers={**provider_auth_headers, "Content-Type": "application/json"},
+                                          json={"name": candidate_exact_name},
+                                          timeout=(15, 30),
+                                      )
+                                      if rename_resp.status_code in (200, 204):
+                                          final_remote_name = candidate_exact_name
+                                          print(f"::notice title={provider_label} Exact Filename Restored::Restored filename via File Manager PATCH: {candidate_exact_name}")
+                                          break
+                                  except Exception:
+                                      pass
+
+                          verified_file_id = account_file_id
+                          verified_returned_url = candidate_returned_url
+                          print(
+                              f"::notice title={provider_label} Upload Accepted::File ID {verified_file_id}; "
+                              f"isolated directory {folder_name}; remote name {final_remote_name}."
+                          )
+                          break
+                      except Exception as attempt_err:
+                          last_upload_error = attempt_err
+                          print(f"::warning title={provider_label} Upload Attempt {upload_attempt}::{attempt_err}")
+                          if upload_attempt < 3:
                               update_progress(
                                   "uploading",
-                                  f"FUCKINGFAST reported a duplicate. Re-uploading the exact same filename into a fresh directory ({duplicate_retry}/5).",
+                                  f"{provider_label} upload attempt {upload_attempt} encountered an error ({attempt_err}). Retrying in a new isolated directory...",
                                   file_name,
                               )
-                              print(
-                                  f"::warning title=FUCKINGFAST Duplicate Retry::Attempt {duplicate_retry}/5; "
-                                  f"new directory {retry_folder_name}; filename remains exactly '{file_name}'."
-                              )
-                              retry_process = subprocess.run(
-                                  curl_command,
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE,
-                                  text=True,
-                                  encoding="utf-8",
-                                  errors="replace",
-                                  check=False,
-                              )
-                              retry_status_lines = (retry_process.stdout or "").strip().splitlines()
-                              try:
-                                  curl_http_status = int(retry_status_lines[-1]) if retry_status_lines else 0
-                              except (TypeError, ValueError):
-                                  curl_http_status = 0
-                              try:
-                                  with open(curl_response_path, "r", encoding="utf-8", errors="replace") as retry_response_file:
-                                      curl_response_text = retry_response_file.read()
-                              except OSError:
-                                  curl_response_text = ""
+                              time.sleep(10)
+                      finally:
+                          for temporary_path in (curl_config_path, curl_response_path):
+                              if temporary_path:
+                                  try:
+                                      os.remove(temporary_path)
+                                  except OSError:
+                                      pass
 
-                              if retry_process.returncode != 0:
-                                  retry_stderr = (retry_process.stderr or "")[-1200:]
-                                  raise RuntimeError(
-                                      "FUCKINGFAST duplicate retry upload transport failed "
-                                      f"(cURL exit {retry_process.returncode}): {retry_stderr}"
-                                  )
-                              if curl_http_status in (200, 201):
-                                  duplicate_retry_succeeded = True
-                                  break
-                              last_duplicate_error = curl_response_text[:1200] or f"HTTP {curl_http_status}"
-                              retry_error_lower = last_duplicate_error.casefold()
-                              if curl_http_status not in (400, 409) or not any(
-                                  marker in retry_error_lower
-                                  for marker in ("file already exists", "already exists with the same name", "same name", "duplicate filename")
-                              ):
-                                  raise RuntimeError(
-                                      "FUCKINGFAST retry failed for a reason other than a duplicate filename "
-                                      f"(HTTP {curl_http_status}): {last_duplicate_error}"
-                                  )
-                              time.sleep(min(45, duplicate_retry * 8))
+                  if not verified_file_id:
+                      raise RuntimeError(f"{provider_label} upload failed after 3 isolated-directory attempts: {last_upload_error}")
 
-                          if not duplicate_retry_succeeded:
-                              raise RuntimeError(
-                                  "FUCKINGFAST continued rejecting the exact original filename as a duplicate after "
-                                  f"5 fresh-directory retries: {last_duplicate_error}. No alternate filename or link was saved."
-                              )
+                  if verified_returned_url:
+                      parsed_provider_url = urlparse(verified_returned_url)
+                      if parsed_provider_url.scheme != "https" or not parsed_provider_url.hostname or not (
+                          parsed_provider_url.hostname == provider_domain or parsed_provider_url.hostname.endswith("." + provider_domain)
+                      ):
+                          verified_returned_url = ""
 
-                      try:
-                          upload_data = json.loads(curl_response_text)
-                      except ValueError:
-                          # The API documentation does not specify a response schema.
-                          # Accept JSON objects as well as a plain ID / HTTPS URL response.
-                          upload_data = {"raw": curl_response_text.strip()}
-
-                      response_code = upload_data.get("code") if isinstance(upload_data, dict) else None
-                      response_data = upload_data.get("data") if isinstance(upload_data, dict) and isinstance(upload_data.get("data"), dict) else upload_data
-                      fuckingfast_file_id = ""
-                      if isinstance(response_data, dict):
-                          for id_key in ("id", "fileId", "file_id", "hash"):
-                              candidate_id = response_data.get(id_key)
-                              if isinstance(candidate_id, (str, int)) and str(candidate_id).strip():
-                                  fuckingfast_file_id = str(candidate_id).strip()
-                                  break
-                      fuckingfast_returned_url = ""
-                      if isinstance(response_data, dict):
-                          for url_key in ("url", "downloadUrl", "download_url", "downloadPage", "downloadPageUrl", "shareUrl", "share_url", "link"):
-                              candidate_url = response_data.get(url_key)
-                              if isinstance(candidate_url, str) and candidate_url.strip().startswith("https://"):
-                                  fuckingfast_returned_url = candidate_url.strip()
-                                  break
-                      if isinstance(upload_data, str):
-                          raw_value = upload_data.strip()
-                      elif isinstance(upload_data, dict):
-                          raw_value = str(upload_data.get("raw", "")).strip()
-                      else:
-                          raw_value = ""
-                      if not fuckingfast_returned_url and raw_value:
-                          if raw_value.startswith("https://"):
-                              fuckingfast_returned_url = raw_value
-                          elif len(raw_value) <= 500 and " " not in raw_value:
-                              fuckingfast_file_id = raw_value
-
-                      # The developer page documents HTTP upload routes but not
-                      # their JSON response schema. Trust HTTP 200/201 above,
-                      # while still rejecting an explicit API-level failure.
-                      if isinstance(upload_data, dict):
-                          api_status = str(upload_data.get("status", "")).strip().casefold()
-                          if upload_data.get("success") is False or api_status in ("error", "failed", "failure"):
-                              raise RuntimeError(
-                                  "FUCKINGFAST API reported an unsuccessful upload: "
-                                  f"{curl_response_text[:1200]}"
-                              )
-                      # The API response schema is not documented. The authenticated
-                      # File Manager lookup below is the final source of truth for the ID.
-
-                      # Verify only the directory created for this queue run.
-                      # This is post-upload verification, not a duplicate scan:
-                      # the folder was empty when created and isolated to this job.
-                      account_file_id = ""
-                      account_file_item = None
-                      fuckingfast_size_verified = False
-                      expected_file_size = int(os.path.getsize(file_path))
-                      verify_directory_url = f"https://fuckingfast.net/api/fs/{quote(upload_directory_id, safe='')}"
-                      for verify_attempt in range(1, 5):
-                          verify_directory_response = requests.get(
-                              verify_directory_url,
-                              headers=fuckingfast_auth_headers,
-                              timeout=(20, 90),
-                          )
-                          if verify_directory_response.status_code != 200:
-                              raise RuntimeError(
-                                  "FUCKINGFAST post-upload directory verification failed "
-                                  f"(HTTP {verify_directory_response.status_code}): {verify_directory_response.text[:700]}"
-                              )
-                          try:
-                              verify_directory_payload = verify_directory_response.json()
-                          except ValueError as error:
-                              raise RuntimeError("FUCKINGFAST returned invalid JSON while verifying the isolated upload directory.") from error
-
-                          for found_name, found_id, found_item in _walk_named_items(verify_directory_payload):
-                              if found_name != fuckingfast_remote_upload_name:
-                                  continue
-                              candidate_size = None
-                              if isinstance(found_item, dict):
-                                  for size_key in ("size", "fileSize", "file_size", "bytes"):
-                                      value = found_item.get(size_key)
-                                      if isinstance(value, (int, float)):
-                                          candidate_size = int(value)
-                                          break
-                                      if isinstance(value, str) and value.strip().isdigit():
-                                          candidate_size = int(value.strip())
-                                          break
-                              if candidate_size is not None and candidate_size != expected_file_size:
-                                  raise RuntimeError(
-                                      "FUCKINGFAST listed the uploaded filename but its stored size does not match "
-                                      f"the source file: expected {expected_file_size} bytes, received {candidate_size} bytes."
-                                  )
-                              if candidate_size is not None:
-                                  fuckingfast_size_verified = True
-                              account_file_id = found_id
-                              account_file_item = found_item
-                              break
-
-                          if account_file_id:
-                              break
-                          if verify_attempt < 4:
-                              update_progress(
-                                  "checking_account",
-                                  f"Upload accepted; waiting for FUCKINGFAST to expose the file in its isolated directory (verification {verify_attempt}/4).",
-                                  file_name,
-                              )
-                              time.sleep(3)
-
-                      if not account_file_id:
-                          detail_id = f" Upload response file ID: {fuckingfast_file_id}." if fuckingfast_file_id else " The upload response did not include a usable file ID."
-                          raise RuntimeError(
-                              "FUCKINGFAST accepted the upload request, but the exact original filename could not be "
-                              "verified in this job's isolated directory after 4 checks. The link was not saved and "
-                              "no alternate remote filename was generated."
-                              + detail_id
-                          )
-
-                      if fuckingfast_file_id and account_file_id != fuckingfast_file_id:
-                          print("::warning title=FUCKINGFAST File ID::The directory listing ID differs from the upload response; using the ID verified inside this job's isolated directory.")
-                      fuckingfast_file_id = account_file_id
-                      if fuckingfast_needs_rename:
-                          rename_response = requests.patch(
-                              f"https://fuckingfast.net/api/fs/{quote(fuckingfast_file_id, safe='')}",
-                              headers={**fuckingfast_auth_headers, "Content-Type": "application/json"},
-                              json={"name": file_name},
-                              timeout=(20, 90),
-                          )
-                          if rename_response.status_code not in (200, 201, 204):
-                              raise RuntimeError(
-                                  "FUCKINGFAST uploaded the temporary transfer file but could not restore the exact original filename through File Manager rename "
-                                  f"(HTTP {rename_response.status_code}): {rename_response.text[:900]}. No link was saved."
-                              )
-                          renamed_verified = False
-                          for rename_verify_attempt in range(1, 6):
-                              renamed_listing_response = requests.get(
-                                  verify_directory_url,
-                                  headers=fuckingfast_auth_headers,
-                                  timeout=(20, 90),
-                              )
-                              if renamed_listing_response.status_code != 200:
-                                  raise RuntimeError(
-                                      "FUCKINGFAST could not verify the renamed original filename "
-                                      f"(HTTP {renamed_listing_response.status_code}): {renamed_listing_response.text[:700]}"
-                                  )
-                              try:
-                                  renamed_listing_payload = renamed_listing_response.json()
-                              except ValueError as error:
-                                  raise RuntimeError("FUCKINGFAST returned invalid JSON after renaming the file.") from error
-                              for renamed_name, renamed_id, renamed_item in _walk_named_items(renamed_listing_payload):
-                                  if renamed_name == file_name and renamed_id == fuckingfast_file_id:
-                                      renamed_size = None
-                                      if isinstance(renamed_item, dict):
-                                          for size_key in ("size", "fileSize", "file_size", "bytes"):
-                                              size_value = renamed_item.get(size_key)
-                                              if isinstance(size_value, (int, float)) or (isinstance(size_value, str) and size_value.strip().isdigit()):
-                                                  renamed_size = int(size_value)
-                                                  break
-                                      if renamed_size is not None and renamed_size != expected_file_size:
-                                          raise RuntimeError(f"FUCKINGFAST renamed file size mismatch: expected {expected_file_size}, received {renamed_size}.")
-                                      if renamed_size is not None:
-                                          fuckingfast_size_verified = True
-                                      account_file_item = renamed_item
-                                      renamed_verified = True
-                                      break
-                              if renamed_verified:
-                                  break
-                              if rename_verify_attempt < 5:
-                                  time.sleep(3)
-                          if not renamed_verified:
-                              raise RuntimeError(
-                                  "FUCKINGFAST did not expose the exact original filename after the File Manager rename. "
-                                  "The final link was not saved and no numbered/alternate filename was generated."
-                              )
-                      if isinstance(account_file_item, dict) and not fuckingfast_returned_url:
-                          for item_url_key in ("url", "downloadUrl", "download_url", "downloadPage", "downloadPageUrl", "shareUrl", "share_url", "link"):
-                              candidate_item_url = account_file_item.get(item_url_key)
-                              if isinstance(candidate_item_url, str) and candidate_item_url.strip().startswith("https://"):
-                                  fuckingfast_returned_url = candidate_item_url.strip()
-                                  break
-
-                      if fuckingfast_returned_url:
-                          from urllib.parse import urlparse
-                          parsed_fuckingfast_url = urlparse(fuckingfast_returned_url)
-                          if parsed_fuckingfast_url.scheme != "https" or not parsed_fuckingfast_url.hostname or not (parsed_fuckingfast_url.hostname == "fuckingfast.net" or parsed_fuckingfast_url.hostname.endswith(".fuckingfast.net")):
-                              raise RuntimeError("FUCKINGFAST returned a URL outside the official HTTPS domain. Upload result was not saved.")
-
-                      returned_name = str(response_data.get("name", "")).strip() if isinstance(response_data, dict) else ""
-                      if returned_name and returned_name != fuckingfast_remote_upload_name:
-                          raise RuntimeError(
-                              "FUCKINGFAST accepted the upload but returned an unexpected transfer filename. "
-                              f"Expected '{fuckingfast_remote_upload_name}', received '{returned_name}'."
-                          )
-                      returned_size = response_data.get("size") if isinstance(response_data, dict) else None
-                      if returned_size is not None:
-                          try:
-                              if int(returned_size) != int(os.path.getsize(file_path)):
-                                  raise RuntimeError(
-                                      "FUCKINGFAST returned a file size that does not match the uploaded source: "
-                                      f"expected {os.path.getsize(file_path)} bytes, received {returned_size} bytes."
-                                  )
-                              fuckingfast_size_verified = True
-                          except (TypeError, ValueError):
-                              print("::warning title=FUCKINGFAST Response::Could not parse returned file size; file ID was present and API success code was accepted.")
-                      if not fuckingfast_size_verified:
-                          raise RuntimeError(
-                              "FUCKINGFAST did not expose a verifiable stored file size through its File Manager or upload response. "
-                              "The upload URL was not saved because the uploaded bytes could not be confirmed."
-                          )
-                      returned_location_id = str(response_data.get("locationId", "")).strip() if isinstance(response_data, dict) else ""
-                      if returned_location_id and returned_location_id != location_id:
-                          print(
-                              f"::warning title=FUCKINGFAST Region::Requested location {location_id}, "
-                              f"but API response reports {returned_location_id}. Check the file in FUCKINGFAST File Manager."
-                          )
-                      print(
-                          f"::notice title=FUCKINGFAST Upload Accepted::API code {response_code or curl_http_status}; "
-                          f"file ID {fuckingfast_file_id}; remote name {returned_name or fuckingfast_upload_name}."
-                      )
-                  finally:
-                      for temporary_path in (curl_config_path, curl_response_path):
-                          if temporary_path:
-                              try:
-                                  os.remove(temporary_path)
-                              except OSError:
-                                  pass
-
-                  result_url = fuckingfast_returned_url or f"https://fuckingfast.net/{quote(fuckingfast_file_id, safe='')}"
-                  from urllib.parse import urlparse
+                  result_url = verified_returned_url or f"https://{provider_domain}/{quote(verified_file_id, safe='')}"
                   parsed_public_url = urlparse(result_url)
                   if parsed_public_url.scheme != "https" or not parsed_public_url.hostname or not (
-                      parsed_public_url.hostname == "fuckingfast.net" or parsed_public_url.hostname.endswith(".fuckingfast.net")
+                      parsed_public_url.hostname == provider_domain or parsed_public_url.hostname.endswith("." + provider_domain)
                   ):
-                      raise RuntimeError("FUCKINGFAST did not produce an HTTPS public page URL on its official domain. No link was saved.")
+                      raise RuntimeError(f"{provider_label} did not produce an HTTPS public page URL on its official domain. No link was saved.")
 
-                  # Public page probes can be challenged by the provider's edge/WAF.
-                  # The upload has already been verified independently through the
-                  # authenticated File Manager (job-isolated directory, exact original
-                  # filename, file ID and source size). Therefore 403/429/5xx or a
-                  # transient network error are inconclusive, not proof of a dead file.
-                  # Only explicit 404/410 responses or an explicit unavailable page
-                  # are treated as a failed public link. Never invent a new filename.
+                  # Verify that the newly-created public link is live and not a 404/deleted page.
                   public_probe_note = "Public page probe completed."
                   try:
                       with requests.get(
                           result_url,
                           headers={
-                              # Use a normal browser UA; the previous CLOBD bot UA
-                              # could trigger automated-request protection.
                               "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                               "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/octet-stream;q=0.8,*/*;q=0.7",
                               "Accept-Language": "en-US,en;q=0.9",
@@ -2090,13 +1438,13 @@ jobs:
                           probe_status = int(link_check_response.status_code)
                           final_public_url = urlparse(link_check_response.url)
                           if final_public_url.scheme != "https" or not final_public_url.hostname or not (
-                              final_public_url.hostname == "fuckingfast.net" or final_public_url.hostname.endswith(".fuckingfast.net")
+                              final_public_url.hostname == provider_domain or final_public_url.hostname.endswith("." + provider_domain)
                           ):
-                              raise RuntimeError("FUCKINGFAST public link redirected outside its official HTTPS domain. The link was not saved.")
+                              raise RuntimeError(f"{provider_label} public link redirected outside its official HTTPS domain. The link was not saved.")
 
                           if probe_status in (404, 410):
                               raise RuntimeError(
-                                  f"FUCKINGFAST public link returned HTTP {probe_status}. "
+                                  f"{provider_label} public link returned HTTP {probe_status}. "
                                   "The provider reports the public page is missing; the URL was not saved."
                               )
                           if probe_status < 200 or probe_status >= 400:
@@ -2105,7 +1453,7 @@ jobs:
                                   "the exact file ID/name/size were verified in the authenticated isolated directory."
                               )
                               print(
-                                  f"::warning title=FUCKINGFAST Public Link Probe::{public_probe_note} "
+                                  f"::warning title={provider_label} Public Link Probe::{public_probe_note} "
                                   "Keeping the canonical file-ID URL instead of falsely marking the successful upload as failed."
                               )
                           else:
@@ -2128,21 +1476,20 @@ jobs:
                                   "404 not found",
                               )
                               if any(marker in preview_text for marker in unavailable_markers):
-                                  raise RuntimeError("FUCKINGFAST returned an unavailable/deleted-file page for the new upload. The link was not saved.")
+                                  raise RuntimeError(f"{provider_label} returned an unavailable/deleted-file page for the new upload. The link was not saved.")
                   except requests.RequestException as probe_error:
                       public_probe_note = (
                           "Public-page probe could not complete; "
                           "the exact file ID/name/size were verified in the authenticated isolated directory."
                       )
                       print(
-                          f"::warning title=FUCKINGFAST Public Link Probe::{public_probe_note} "
+                          f"::warning title={provider_label} Public Link Probe::{public_probe_note} "
                           f"Network detail: {str(probe_error)[:500]}"
                       )
 
                   message = (
-                      f"FUCKINGFAST authenticated upload completed and the exact file ID/name/size were verified "
-                      f"in the isolated account directory ({FUCKINGFAST_REGION}). "
-                      f"Final remote filename (exact original CLOBD name): {fuckingfast_upload_name}. "
+                      f"{provider_label} authenticated upload completed and verified in an isolated account directory "
+                      f"({provider_region}). Remote filename (no suffix): {final_remote_name}. "
                       f"File size: {file_size_gb} GiB. {public_probe_note}"
                   )
 
