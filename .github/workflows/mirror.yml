@@ -838,9 +838,11 @@ jobs:
                               raise RuntimeError(f"Gofile upload failed (HTTP {upload_response.status_code}, status {error_status}): {upload_response.text[:1200]}")
                           data = upload_data.get("data") if isinstance(upload_data.get("data"), dict) else {}
 
-                          # Gofile's downloadPage points to parentFolderCode (the
-                          # folder containing the upload). data.code is the
-                          # uploaded FILE's own public share code.
+                          # Gofile's downloadPage points to the parent folder.
+                          # Require the upload response's own file code instead.
+                          returned_type = str(data.get("type") or "").strip().lower()
+                          if returned_type and returned_type != "file":
+                              raise RuntimeError(f"Gofile returned a non-file upload object (type={returned_type!r}); folder links are not accepted.")
                           file_share_code = str(data.get("code") or "").strip()
                           if not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", file_share_code):
                               raise RuntimeError(
