@@ -837,11 +837,19 @@ jobs:
                               error_status = upload_data.get("status") if isinstance(upload_data, dict) else "unknown"
                               raise RuntimeError(f"Gofile upload failed (HTTP {upload_response.status_code}, status {error_status}): {upload_response.text[:1200]}")
                           data = upload_data.get("data") if isinstance(upload_data.get("data"), dict) else {}
-                          candidate_url = str(data.get("downloadPage") or "").strip()
-                          if not candidate_url and data.get("code"):
-                              candidate_url = f"https://gofile.io/d/{data['code']}"
-                          if not candidate_url.startswith("https://gofile.io/"):
-                              raise RuntimeError("Gofile reported success but did not return a valid public downloadPage URL.")
+
+                          # Gofile's downloadPage points to parentFolderCode (the
+                          # folder containing the upload). data.code is the
+                          # uploaded FILE's own public share code.
+                          file_share_code = str(data.get("code") or "").strip()
+                          if not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", file_share_code):
+                              raise RuntimeError(
+                                  "Gofile reported upload success but did not return a valid file share code in data.code. "
+                                  "The parent-folder downloadPage is intentionally not used."
+                              )
+                          candidate_url = f"https://gofile.io/d/{quote(file_share_code, safe='')}"
+                          if not candidate_url.startswith("https://gofile.io/d/"):
+                              raise RuntimeError("Gofile reported success but did not return a valid public FILE share URL.")
 
                           # Probe the public Gofile share link to make sure it is not 404/410.
                           try:
